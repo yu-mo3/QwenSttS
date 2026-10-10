@@ -39,6 +39,8 @@ htmlcov/
 models/*
 !models/.gitkeep
 !models/README.md
+# 唤醒词定义是配置而非模型体积，需要入库
+!models/keywords*.txt
 
 # ---------- 💾 运行产物 ----------
 data/
