@@ -49,8 +49,12 @@ recordings/
 cache/
 
 # ---------- 🛠️ IDE / 编辑器 ----------
+# 调试配置属于团队共享资产，需要入库；个人偏好设置仍然忽略
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
-.vscode/
 *.swp
 *.swo
 *~

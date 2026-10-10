@@ -1,0 +1,17 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "python.testing.pytestEnabled": false,
+  "files.encoding": "utf8",
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "editor.rulers": [100],
+  "editor.formatOnSave": false,
+  "[python]": {
+    "editor.tabSize": 4
+  },
+  "[bat]": {
+    "files.eol": "\r\n"
+  }
+}
