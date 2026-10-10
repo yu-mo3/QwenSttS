@@ -267,6 +267,13 @@ Windows 有 MME / DirectSound / WASAPI / WDM-KS 四套音频接口，同一硬�
 | 打断 | 无 | 支持 |
 </details>
 
+## 📚 项目文档
+
+| 文件 | 内容 |
+|---|---|
+| [AGENTS.md](AGENTS.md) | 协作约定：审查流程、分层铁律、编码与提交规范 |
+| [KNOWN_ISSUES.md](KNOWN_ISSUES.md) | 已知问题：审查发现但决定暂不修复的项，含原因与重做时机 |
+
 ## 📄 许可
 
 [MIT](LICENSE) © yu-mo3
