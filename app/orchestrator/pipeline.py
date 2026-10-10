@@ -30,7 +30,7 @@ from app.capabilities.asr import SpeechRecognizer, Transcript
 from app.capabilities.llm import ChatProvider, ConversationMemory
 from app.capabilities.tts import SpeechSynthesizer
 from app.config import Config
-from app.core.errors import ApiError
+from app.core.errors import ApiError, AyuanError
 from app.core.logger import get_logger
 
 log = get_logger(__name__)
@@ -43,6 +43,7 @@ EVT_LLM_DONE = "llm_done"
 EVT_TTS_DONE = "tts_done"
 EVT_PLAYBACK_START = "playback_start"
 EVT_PLAYBACK_DONE = "playback_done"
+EVT_RETRY = "retry"
 EVT_ERROR = "error"
 
 EventCallback = Callable[[str, dict[str, Any]], None]
@@ -99,7 +100,7 @@ class VoicePipeline:
     @property
     def asr(self) -> SpeechRecognizer:
         if self._asr is None:
-            self._asr = SpeechRecognizer(self.config)
+            self._asr = SpeechRecognizer(self.config, on_retry=self._on_retry)
         return self._asr
 
     @property
@@ -111,10 +112,18 @@ class VoicePipeline:
     @property
     def tts(self) -> SpeechSynthesizer:
         if self._tts is None:
-            self._tts = SpeechSynthesizer(self.config)
+            self._tts = SpeechSynthesizer(self.config, on_retry=self._on_retry)
         return self._tts
 
     # ---------- 事件 ----------
+
+    def _on_retry(self, attempt: int, total: int, reason: str) -> None:
+        """云端调用失败后、重试前的回调。
+
+        必须让用户看见 —— 否则超时加退避会让终端静默好几分钟，
+        用户只会以为程序死了然后强杀。
+        """
+        self._emit(EVT_RETRY, attempt=attempt, total=total, reason=reason)
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self.on_event is not None:
@@ -154,21 +163,48 @@ class VoicePipeline:
         )
         return reply.text, reply.sentences
 
-    def speak(self, sentences: list[str]) -> float:
-        """逐句合成并播放，返回音频总时长。"""
+    def speak(self, sentences: list[str]) -> tuple[float, float, float]:
+        """逐句合成并播放。
+
+        返回 (合成耗时, 播放耗时, 音频总时长)。
+        合成与播放分开计时 —— 之前合并成一项目，而 timing_summary() 的
+        显示键却是分开的，导致「对话 1.53s · 合计 8.94s」这种分项对不上
+        合计的输出，恰好把最慢的一环藏了起来。
+        """
+        tts_time = 0.0
+        play_time = 0.0
         total_audio = 0.0
+        played = 0
+
         for index, sentence in enumerate(sentences, 1):
+            started = time.monotonic()
             result = self.tts.synthesize(sentence)
+            tts_time += time.monotonic() - started
+
             if result.is_empty:
                 log.warning("第 %d 句合成结果为空，跳过", index)
                 continue
+
             total_audio += result.duration
+            played += 1
             self._emit(EVT_TTS_DONE, index=index, total=len(sentences), duration=result.duration)
 
             self._emit(EVT_PLAYBACK_START, index=index)
+            started = time.monotonic()
             self.speaker.play(result.audio)
+            play_time += time.monotonic() - started
             self._emit(EVT_PLAYBACK_DONE, index=index)
-        return total_audio
+
+        # 有句子却一句都没播出来 = 静默失败。
+        # 否则 run_once 会返回 failed=False，而 --say 的退出码是 0 ——
+        # 用户什么都没听到，CI 却判定验收通过。
+        if sentences and played == 0:
+            raise ApiError(
+                "语音合成为空",
+                hint="云端返回了音频但内容为空，可能是文本里只有符号或表情",
+            )
+
+        return tts_time, play_time, total_audio
 
     def run_once(
         self,
@@ -213,14 +249,24 @@ class VoicePipeline:
 
             # ---- 4&5. 合成 + 播放 ----
             if speak:
-                t0 = time.monotonic()
-                result.audio_seconds = self.speak(result.sentences)
-                result.timings["合成播放"] = time.monotonic() - t0
+                tts_time, play_time, audio_seconds = self.speak(result.sentences)
+                result.timings["合成"] = tts_time
+                result.timings["播放"] = play_time
+                result.audio_seconds = audio_seconds
 
-        except ApiError as exc:
+        except AyuanError as exc:
+            # 必须捕获整个 AyuanError 家族而不只是 ApiError：
+            # Speaker.play() 抛的 AudioDeviceError（蓝牙中途断连、被会议软件抢占）
+            # 原先会直接穿透 run_once，把 traceback 甩给用户。
             result.failed = True
             result.error = str(exc)
             self._emit(EVT_ERROR, message=str(exc), hint=exc.hint)
+        except Exception as exc:  # noqa: BLE001 — 最后一道防线
+            # 任何未预料的异常也不该以 traceback 收场
+            result.failed = True
+            result.error = f"{type(exc).__name__}: {exc}"
+            log.exception("对话流程出现未预料的异常")
+            self._emit(EVT_ERROR, message=result.error, hint="")
 
         return result
 

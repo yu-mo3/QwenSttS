@@ -148,7 +148,9 @@ class ModelSettings:
     tts_voice: str = "Cherry"
 
     enable_thinking: bool = False
-    timeout: int = 60
+    # 语音助手不该等 60 秒。20s 已足够覆盖网络抖动，
+    # 再长只会让「重试 3 次」的最坏情况变成 3 分钟静默挂起。
+    timeout: int = 20
 
     # 助手名称：唤醒词与提示词共用同一个来源
     name: str = "阿源"

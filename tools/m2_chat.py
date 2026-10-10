@@ -34,6 +34,7 @@ from app.orchestrator.pipeline import (
     EVT_PLAYBACK_START,
     EVT_RECORDING_DONE,
     EVT_RECORDING_START,
+    EVT_RETRY,
     EVT_TTS_DONE,
     VoicePipeline,
 )
@@ -75,6 +76,8 @@ def make_printer():
             print(f"     🎵 合成第 {payload['index']}/{payload['total']} 句 · {payload['duration']:.1f}s 音频")
         elif event == EVT_PLAYBACK_START:
             print(f"     ▶️  播放第 {payload['index']} 句…")
+        elif event == EVT_RETRY:
+            print(f"     ⏳ 云端未响应，{payload['attempt']} 秒后重试（第 {payload['attempt']}/{payload['total']} 次）：{payload['reason'][:40]}")
         elif event == EVT_ERROR:
             print(f"\n  ❌ {payload['message']}")
             if payload.get("hint"):
@@ -83,8 +86,23 @@ def make_printer():
     return on_event
 
 
+# 已创建的流水线集合：退出时统一释放，避免音频设备被占住
+_PIPELINES: list[VoicePipeline] = []
+
+
 def build_pipeline(config: Config) -> VoicePipeline:
-    return VoicePipeline(config, on_event=make_printer())
+    pipeline = VoicePipeline(config, on_event=make_printer())
+    _PIPELINES.append(pipeline)
+    return pipeline
+
+
+def pipeline_close() -> None:
+    for pipeline in _PIPELINES:
+        try:
+            pipeline.close()
+        except Exception:
+            pass
+    _PIPELINES.clear()
 
 
 def text_mode(config: Config) -> int:
@@ -108,7 +126,7 @@ def text_mode(config: Config) -> int:
         started = time.monotonic()
         result = pipeline.run_once(text_override=user_text)
         if result.failed:
-            print(f"  ❌ {result.error}")
+            # 错误详情已由 EVT_ERROR 事件打印过，这里不再重复
             continue
         print(f"     ⏱  {result.timing_summary()}")
 
@@ -141,7 +159,7 @@ def voice_mode(config: Config, seconds: float) -> int:
             return 1
 
         if result.failed:
-            print(f"  ⚠️  {result.error}")
+            # 错误详情已由 EVT_ERROR 事件打印过，这里不再重复
             continue
 
         print(f"     ⏱  {result.timing_summary()}")
@@ -183,9 +201,13 @@ def main() -> int:
         print(f"\n  ⏱  {result.timing_summary()}")
         return 1 if result.failed else 0
 
-    if args.text:
-        return text_mode(config)
-    return voice_mode(config, args.seconds)
+    try:
+        if args.text:
+            return text_mode(config)
+        return voice_mode(config, args.seconds)
+    finally:
+        # 释放音频设备与 HTTP 连接池
+        pipeline_close()
 
 
 if __name__ == "__main__":
