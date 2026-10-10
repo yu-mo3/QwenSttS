@@ -12,6 +12,10 @@
 
 **对策：只信任 fmt chunk，音频数据一律按「实际剩余字节」截断。**
 本模块是项目中唯一允许解析 WAV 头的地方。
+
+⚠️ **接口冻结提示**：L4 能力层（app/capabilities/base.py）依赖本模块的
+pcm_to_wav / wav_duration。若要挪动这些纯编解码函数（例如上移到
+app/core/），请同步修改能力层 —— 它们是跨层契约，不是设备层私有的。
 """
 
 from __future__ import annotations

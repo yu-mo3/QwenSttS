@@ -44,9 +44,14 @@ class SynthesisResult:
 class SpeechSynthesizer:
     """语音合成。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        on_retry: Callable[[int, int, str], None] | None = None,
+    ) -> None:
         self.config = config
-        self.http = HttpClient(config)
+        self.http = HttpClient(config, on_retry=on_retry)
 
     @property
     def voice(self) -> str:
@@ -67,7 +72,7 @@ class SpeechSynthesizer:
                   TTS 会把星号、井号这类符号原样念出来。
             voice: 音色覆盖，默认取配置（Cherry）
             model: 模型覆盖。传 instructions 时应使用 instruct 版本
-            instructions: 自然语言语气指令，例如
+            instructions: 自然语言语气指令（**M5 预留，尚未接入调用方**），例如
                   「用温柔知心、语速稍慢的语气，像老朋友聊天一样」
         """
         text = (text or "").strip()
@@ -91,12 +96,14 @@ class SpeechSynthesizer:
                 payload,
             ),
             what="语音合成",
+            on_retry=self.http.on_retry,
         )
 
         url = self._extract_url(body)
         audio = call_with_retry(
             lambda: self.http.get_bytes(url),
             what="下载合成音频",
+            on_retry=self.http.on_retry,
         )
         elapsed = time.monotonic() - started
 
