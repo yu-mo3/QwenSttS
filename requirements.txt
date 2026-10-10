@@ -23,8 +23,13 @@ openai>=3.28,<4            # 百炼 OpenAI 兼容端点（LLM / VLM）
 sherpa-onnx>=1.13.8,<2      # 关键词唤醒（KWS）+ 模型文件
 webrtcvad-wheels>=2.0.14    # 语音活动检测（VAD）
 
-# ---- L6 表现层（M4 里程碑启用）----
-# PySide6>=6.8.0
+# ---- L6 表现层（M4）----
+# 用 Essentials 而不是完整 PySide6：完整包会额外拖进 PySide6-WebEngine
+# （实测 131.7MB）与 PySide6-Addons（40.5MB），我们一行都用不到。
+# Essentials 提供同一个 PySide6 命名空间，只是少了那些用不上的模块。
+# 注意：6.12 起 wheel **不再自带 ICU**，conda 环境里的旧 ICU 会抢走
+# Qt6Core 需要的 ucnv_* 符号 —— 见 app/ui/qt_runtime.py 的说明与修法。
+PySide6-Essentials>=6.8.0
 
 # ---- 视觉（M5 里程碑启用）----
 # opencv-python>=4.10.0

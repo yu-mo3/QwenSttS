@@ -2,6 +2,29 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "▶ 启动阿源（界面）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/ui/app.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    },
+    {
+      "name": "🖼️ 界面（不启动语音会话）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/ui/app.py",
+      "args": [
+        "--no-session",
+        "-v"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
       "name": "▶ 启动阿源",
       "type": "debugpy",
       "request": "launch",

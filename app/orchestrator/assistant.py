@@ -435,6 +435,32 @@ class VoiceAssistant:
         """清掉待处理的停止请求（界面点「取消」时用）。"""
         self.speaker.clear_stop()
 
+    def set_idle_timeout(self, seconds: float) -> None:
+        """改静默超时。可以从其他线程调用。
+
+        单个 float 赋值是原子的；最坏情况是这一轮多等一帧才生效，
+        没有正确性问题。
+        """
+        self.idle_timeout = max(1.0, float(seconds))
+
+    def set_thresholds(
+        self, *, wake: float | None = None, stop: float | None = None
+    ) -> None:
+        """改唤醒 / 停阈值。
+
+        实现方式是**把检测器丢掉**，下次访问属性时按新阈值重建 ——
+        阈值是 KWS 的构造参数（写进模型的 config），没有就地修改的接口。
+
+        主循环里每次都是 self.wake.feed(...)，属性求值与使用在同一次
+        表达式里完成，所以最多有一帧被喂给旧检测器，无正确性影响。
+        """
+        if wake is not None:
+            self._wake_threshold = float(wake)
+            self._wake = None
+        if stop is not None:
+            self._stop_threshold = float(stop)
+            self._stop = None
+
     # ---------- 电平 ----------
 
     def _notify_level(self, level: float, source: str) -> None:
