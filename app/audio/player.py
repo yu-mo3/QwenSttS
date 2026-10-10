@@ -19,7 +19,7 @@ import time
 import numpy as np
 import sounddevice as sd
 
-from app.audio.devices import resolve_device
+from app.audio.devices import resolve_device, resolve_name
 from app.audio.wav import parse_wav
 from app.config import AudioSettings
 from app.core.errors import AudioDeviceError
@@ -67,18 +67,16 @@ class Speaker:
         return self._device_index
 
     def device_name(self) -> str:
-        index = self.device_index
-        if index is None:
-            try:
-                index = sd.default.device[1]
-            except Exception:
-                return "（未知）"
-        if index is None or index < 0:
-            return "（无可用输出设备）"
-        try:
-            return str(sd.query_devices(index)["name"])
-        except Exception:
-            return f"设备 #{index}"
+        return resolve_name(self.device_index, want_input=False)
+
+    def _invalidate_device(self) -> None:
+        """让设备索引在下次访问时重新解析。
+
+        同 capture.py：Windows 的设备索引会漂移，长驻进程用旧索引会
+        静默打开另一台设备（以为在放给耳机听，其实从扬声器外放）。
+        """
+        self._device_resolved = False
+        self._device_index = None
 
     # ---------- 状态 ----------
 
@@ -117,22 +115,39 @@ class Speaker:
             finally:
                 self._playing.clear()
 
-    def _play_loop(self, pcm: bytes, rate: int, channels: int) -> None:
-        frame_size = self.settings.sample_width * channels
-        block_bytes = max(int(rate * _MAX_BLOCK_MS / 1000) * frame_size, frame_size * 160)
+    def _open_stream(self, rate: int, channels: int) -> sd.OutputStream:
+        """打开输出流；失败时重新解析设备再试一次（索引可能已漂移）。"""
 
-        try:
-            stream = sd.OutputStream(
+        def _make() -> sd.OutputStream:
+            return sd.OutputStream(
                 device=self.device_index,
                 samplerate=rate,
                 channels=channels,
                 dtype="int16",
             )
-        except Exception as exc:
-            raise AudioDeviceError(
-                "无法打开扬声器",
-                hint=f"{self.device_name()} 打开失败：{exc}",
-            ) from exc
+
+        try:
+            return _make()
+        except Exception as first_error:
+            self._invalidate_device()
+            try:
+                stream = _make()
+                log.warning("输出设备索引已漂移，重新解析后打开成功：%s", self.device_name())
+                return stream
+            except Exception as exc:
+                raise AudioDeviceError(
+                    "无法打开扬声器",
+                    hint=(
+                        f"{self.device_name()} 打开失败：{exc}。"
+                        "请确认设备未被其他程序独占。首次错误：" + str(first_error)
+                    ),
+                ) from exc
+
+    def _play_loop(self, pcm: bytes, rate: int, channels: int) -> None:
+        frame_size = self.settings.sample_width * channels
+        block_bytes = max(int(rate * _MAX_BLOCK_MS / 1000) * frame_size, frame_size * 160)
+
+        stream = self._open_stream(rate, channels)
 
         with stream:
             for offset in range(0, len(pcm), block_bytes):
@@ -155,8 +170,12 @@ class Speaker:
         rate = self.settings.sample_rate
         t = np.linspace(0, duration, int(rate * duration), endpoint=False)
         wave_data = np.sin(2 * np.pi * frequency * t) * 0.25
-        # 首尾各做 5ms 淡入淡出，避免爆音
-        fade = max(int(rate * 0.005), 1)
+        # 首尾各做 5ms 淡入淡出，避免爆音。
+        # 上界必须夹住数组长度的一半，否则 duration 极小时
+        # np.linspace(0,1,80) 无法广播进长度 1 的数组（实测 ValueError）。
+        fade = min(max(int(rate * 0.005), 1), len(wave_data) // 2)
+        if fade <= 0:
+            return
         envelope = np.ones_like(wave_data)
         envelope[:fade] = np.linspace(0, 1, fade)
         envelope[-fade:] = np.linspace(1, 0, fade)
