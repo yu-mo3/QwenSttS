@@ -31,5 +31,15 @@ webrtcvad-wheels>=2.0.14    # 语音活动检测（VAD）
 # Qt6Core 需要的 ucnv_* 符号 —— 见 app/ui/qt_runtime.py 的说明与修法。
 PySide6-Essentials>=6.8.0
 
+# ---- L2 设备层 · 摄像头（M5）----
+# 摄像头采集放在 app/camera/，与麦克风同级。不用 PySide6 的 QtMultimedia：
+# 那是 L6 表现层的工具箱，让设备层去 import 它会破坏「只向下依赖」这条铁律。
+#
+# 上界 <5 是实测定的：opencv-python 5.0.0.93 在本机**任何后端**
+# （DSHOW / MSMF / FFMPEG / ANY）都打不开摄像头，一律报
+# "backend is generally available but can't be used to capture by index"。
+# 4.x 是经过验证的稳定线。
+opencv-python>=4.10,<5
+
 # ---- 视觉（M5 里程碑启用）----
 # opencv-python>=4.10.0
