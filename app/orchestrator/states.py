@@ -12,6 +12,7 @@
 允许的转换（写成表是为了让非法转换能被拒绝，而不是静默发生）：
 
     IDLE      -> LISTENING          检测到唤醒词
+    IDLE      -> THINKING           收到打字输入（M4：不经过唤醒与聆听）
     LISTENING -> THINKING           语音段结束且识别出内容
     LISTENING -> IDLE               超时没人说话 / 没识别出内容
     THINKING  -> SPEAKING           拿到回复
@@ -24,6 +25,8 @@
 from __future__ import annotations
 
 from enum import Enum
+
+from app.core.errors import AyuanError
 
 
 class AssistantState(str, Enum):
@@ -42,7 +45,15 @@ class AssistantState(str, Enum):
 #: 允许的状态转换。任何不在此表中的转换都会被拒绝并打日志，
 #: 因为非法转换通常意味着代码里有并发 bug，而不是"碰巧发生"。
 ALLOWED_TRANSITIONS: dict[AssistantState, set[AssistantState]] = {
-    AssistantState.IDLE: {AssistantState.LISTENING, AssistantState.EXITING},
+    AssistantState.IDLE: {
+        AssistantState.LISTENING,
+        # M4 新增：打字输入是一条**不经过唤醒与聆听**的入口。
+        # 原先这里没有它，是因为在只有语音入口时「待机直接到思考」
+        # 确实不可能发生 —— 那是把实现现状当成了规则。
+        # 注意 IDLE -> SPEAKING 仍然非法：没有思考就没有话可说。
+        AssistantState.THINKING,
+        AssistantState.EXITING,
+    },
     AssistantState.LISTENING: {
         AssistantState.THINKING,
         AssistantState.IDLE,
@@ -69,10 +80,18 @@ def can_transition(src: AssistantState, dst: AssistantState) -> bool:
     return dst in ALLOWED_TRANSITIONS.get(src, set())
 
 
-class InvalidTransition(RuntimeError):
-    """非法状态转换。"""
+class InvalidTransition(AyuanError):
+    """非法状态转换。
+
+    继承 AyuanError 而不是裸 RuntimeError（M4 修 KI-007①）：
+    它原先不属于异常家族，一旦从 run() 的 try 之外抛出，上层的
+    `except AyuanError` 兜不住，用户看到的就是一段 traceback。
+    """
 
     def __init__(self, src: AssistantState, dst: AssistantState) -> None:
-        super().__init__(f"非法状态转换：{src} -> {dst}")
+        super().__init__(
+            f"非法状态转换：{src} -> {dst}",
+            hint="这通常意味着状态流转出了并发问题，而不是用户操作导致的",
+        )
         self.src = src
         self.dst = dst

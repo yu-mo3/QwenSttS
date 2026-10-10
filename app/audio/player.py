@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
 
 from app.audio.devices import resolve_device, resolve_name
-from app.audio.wav import parse_wav
+from app.audio.wav import parse_wav, pcm_rms
 from app.config import AudioSettings
 from app.core.errors import AudioDeviceError
 from app.core.logger import get_logger
@@ -30,6 +31,11 @@ log = get_logger(__name__)
 # 播放分块的最大时长（毫秒）。块越小 stop() 响应越快，但系统调用越频繁。
 # 20ms 是实测下来「响应速度」与「CPU 开销」的平衡点。
 _MAX_BLOCK_MS = 20
+
+# 每隔几个音频块回报一次播放电平。块本身是 20ms，即 50 块/秒；
+# 每 3 块一次约 16Hz，足够让界面上的波形看起来连续，
+# 又不至于用 50Hz 的重绘把 CPU 吃满。
+_LEVEL_EVERY_N_BLOCKS = 3
 
 
 def parse_audio(data: bytes, fallback_rate: int) -> tuple[bytes, int, int]:
@@ -49,13 +55,22 @@ def parse_audio(data: bytes, fallback_rate: int) -> tuple[bytes, int, int]:
 class Speaker:
     """扬声器。"""
 
-    def __init__(self, settings: AudioSettings) -> None:
+    def __init__(
+        self,
+        settings: AudioSettings,
+        *,
+        on_level: Callable[[float], None] | None = None,
+    ) -> None:
         self.settings = settings
         self._device_index: int | None = None
         self._device_resolved = False
         self._stop_event = threading.Event()
         self._playing = threading.Event()
         self._lock = threading.Lock()
+        # 可选的播放电平回调（M4 界面用它驱动光球的脉动）。
+        # 为 None 时连能量都不算 —— 不订阅就零开销。
+        self._on_level = on_level
+        self._level_tick = 0
 
     # ---------- 设备 ----------
 
@@ -85,10 +100,39 @@ class Speaker:
         return self._playing.is_set()
 
     def stop(self) -> None:
-        """请求停止播放。会在下一个音频块边界生效（约 20ms 内）。"""
-        if self._playing.is_set():
-            self._stop_event.set()
-            log.debug("收到停止播放请求")
+        """请求停止播放。会在下一个音频块边界生效（约 20ms 内）。
+
+        **无条件闭锁**（M4 修 KI-007②）：原先只在 `_playing` 已置位时才
+        置位停止事件，而 `play()` 又会在入口 `clear()` 它 —— 于是
+        「上一句刚播完、下一句还没开始」的那一小段窗口里发出的停止请求
+        会被静默丢掉。用户喊了「停」，她却在 200ms 后接着念下一句。
+
+        现在置位后一直有效，直到被 `play()` 消费或被 `clear_stop()` 清除。
+        """
+        self._stop_event.set()
+        log.debug("收到停止播放请求（%s）", "播放中" if self._playing.is_set() else "空闲中·闭锁")
+
+    def clear_stop(self) -> None:
+        """清除待处理的停止请求。
+
+        调用时机：**新的一段播报开始前**、新会话开始时。
+        语义是「从现在起，之前的停止请求不再作数」——
+        没有这一步，上一次会话遗留的闭锁会把新会话的第一句吃掉。
+        """
+        if self._stop_event.is_set():
+            log.debug("清除遗留的停止请求")
+        self._stop_event.clear()
+
+    def _consume_stop(self) -> bool:
+        """读取并清除停止请求。返回「此前是否被请求过停止」。
+
+        读一次就清掉，是为了让闭锁只作用于**当前这一段**播报，
+        而不是永久性地让后续每一次播放都返回 False。
+        """
+        if self._stop_event.is_set():
+            self._stop_event.clear()
+            return True
+        return False
 
     # ---------- 播放 ----------
 
@@ -107,11 +151,16 @@ class Speaker:
             return True
 
         with self._lock:
-            self._stop_event.clear()
+            # 入口先消费闭锁：句间窗口发出的 stop 必须在**这一句**生效，
+            # 而不是被 clear() 吞掉后当作什么都没发生
+            if self._consume_stop():
+                log.info("播放前已收到停止请求，跳过本次播放")
+                return False
+
             self._playing.set()
             try:
                 self._play_loop(pcm, rate, channels)
-                return not self._stop_event.is_set()
+                return not self._consume_stop()
             finally:
                 self._playing.clear()
 
@@ -161,9 +210,26 @@ class Speaker:
                     break
                 frames = np.frombuffer(chunk[:usable], dtype=np.int16)
                 stream.write(frames.reshape(-1, channels))
+                self._report_level(chunk[:usable])
             else:
                 # for-else：没被打断 → 等硬件缓冲真正播完再返回
                 time.sleep(0.05)
+
+    def _report_level(self, chunk: bytes) -> None:
+        """限频地把播放电平报给订阅方（M4 界面用它驱动光球的脉动）。
+
+        回调抛错只记 debug：界面上少画一帧波形，远没有让播报中断严重。
+        """
+        hook = self._on_level
+        if hook is None:
+            return
+        self._level_tick += 1
+        if self._level_tick % _LEVEL_EVERY_N_BLOCKS:
+            return
+        try:
+            hook(pcm_rms(chunk))
+        except Exception as exc:  # noqa: BLE001 — 订阅方出错不该拖垮播放
+            log.debug("播放电平回调抛错：%s", exc)
 
     def beep(self, frequency: int = 880, duration: float = 0.12) -> None:
         """提示音。用于「唤醒成功」「录音开始」等状态反馈。"""

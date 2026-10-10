@@ -34,7 +34,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,33 +46,52 @@ from app.capabilities.tts import SpeechSynthesizer
 from app.config import Config
 from app.core.errors import ApiError, AyuanError
 from app.core.logger import get_logger
+from app.orchestrator.events import (
+    ALL_COMMANDS,
+    CMD_LISTEN,
+    CMD_RESET,
+    CMD_SHUTDOWN,
+    CMD_STOP_SPEAKING,
+    CMD_SUBMIT_TEXT,
+    EVT_ASR_DONE,
+    EVT_ERROR,
+    EVT_EXIT,
+    EVT_IDLE_TIMEOUT,
+    EVT_INTERRUPTED,
+    EVT_LLM_DONE,
+    EVT_PLAYBACK_DONE,
+    EVT_PLAYBACK_START,
+    EVT_RETRY,
+    EVT_SPEECH_END,
+    EVT_SPEECH_START,
+    EVT_STATE,
+    EVT_TTS_DONE,
+    EVT_WAKE,
+    EventCallback,
+    TurnResult,
+)
 from app.orchestrator.states import AssistantState, InvalidTransition, can_transition
 
 log = get_logger(__name__)
 
-# ── 事件名 ──
-EVT_STATE = "state"
-EVT_WAKE = "wake"
-EVT_SPEECH_START = "speech_start"
-EVT_SPEECH_END = "speech_end"
-EVT_ASR_DONE = "asr_done"
-EVT_LLM_DONE = "llm_done"
-EVT_TTS_DONE = "tts_done"
-EVT_PLAYBACK_START = "playback_start"
-EVT_PLAYBACK_DONE = "playback_done"
-EVT_INTERRUPTED = "interrupted"
-EVT_RETRY = "retry"
-EVT_IDLE_TIMEOUT = "idle_timeout"
-EVT_ERROR = "error"
-EVT_EXIT = "exit"
-
-EventCallback = Callable[[str, dict[str, Any]], None]
+# 事件名 / EventCallback / TurnResult 都住在 events.py —— 与 pipeline 共用同一份
+# 契约（M4 修 KI-006）。这里 import 进来【再导出】，既有的
+#   from app.orchestrator.assistant import EVT_STATE
+# 用法（tools/m3_assistant.py 就在用）保持不变。
 
 # 说这些词结束连续对话
 BYE_WORDS = ("再见", "拜拜", "退下", "结束", "不用了", "退出")
 
 # 帧队列容量：约 2 秒的 20ms 帧。满了丢最旧的。
 _FRAME_QUEUE_SIZE = 100
+
+# 每隔几帧回报一次麦克风电平（M4 界面用它驱动光球的涟漪）。
+# 真实麦克风每帧 20ms = 50 帧/秒，每 3 帧一次约 16Hz ——
+# 波形看起来是连续的，又不会用 50Hz 的重绘把界面拖垮。
+_LEVEL_EVERY_N_FRAMES = 3
+
+#: 电平回调的签名：(0~1 的电平, "mic" | "speaker")。
+LevelCallback = Callable[[float, str], None]
 
 
 @dataclass
@@ -96,25 +115,6 @@ class SessionStats:
         )
 
 
-@dataclass
-class TurnResult:
-    """一轮对话的结果。"""
-
-    user_text: str = ""
-    reply_text: str = ""
-    audio_seconds: float = 0.0
-    played: int = 0
-    interrupted: bool = False
-    failed: bool = False
-    error: str = ""
-    timings: dict[str, float] = field(default_factory=dict)
-
-    def timing_summary(self) -> str:
-        order = ["识别", "对话", "播报"]
-        parts = [f"{k} {self.timings[k]:.2f}s" for k in order if k in self.timings]
-        if parts:
-            parts.append(f"合计 {sum(self.timings.values()):.2f}s")
-        return " · ".join(parts)
 
 
 class _SentenceSpeaker:
@@ -130,11 +130,24 @@ class _SentenceSpeaker:
     def __init__(self, tts: SpeechSynthesizer, speaker: Speaker, emit: EventCallback) -> None:
         self.tts = tts
         self.speaker = speaker
+        # emit 的签名就是 EventCallback(事件名, 载荷字典)。
+        # 原先这里传的是 VoiceAssistant._emit(事件名, **载荷)，声明与调用对不上，
+        # 属于「类型撒谎」—— 正是 KI-006 那一类问题的温床。
+        # 现在由 VoiceAssistant._event_sink 适配成标准签名。
         self._emit = emit
 
-    def run(self, sentences: Iterator[str]) -> tuple[float, int, bool]:
-        """返回 (音频总时长, 成功播放句数, 是否被打断)。"""
-        had_sentences = False   # 迭代器消费后就空了，先记下来
+    def run(self, sentences: Sequence[str]) -> tuple[float, int, bool]:
+        """返回 (音频总时长, 成功播放句数, 是否被打断)。
+
+        入参是 Sequence 而不是 Iterator：需要 len() 来给 tts_done 事件带上
+        total（KI-006 —— 界面靠它显示「第 i / N 句」，pipeline 一直有、
+        assistant 原先漏了，统一订阅时就是必现的 KeyError）。
+        """
+        total = len(sentences)
+        # 一段播报 = 一个停止闭锁的作用域：开始前清掉上一轮遗留的停止请求，
+        # 否则「上次点的停」会把这次的第一句吃掉（KI-007②）
+        self.speaker.clear_stop()
+        had_sentences = False   # 空列表也是一种「没有句子」，先记下来
         pending: queue.Queue = queue.Queue()
         ready: queue.Queue = queue.Queue()
         stop = threading.Event()
@@ -189,16 +202,16 @@ class _SentenceSpeaker:
 
             total_audio += result.duration
             played += 1
-            self._emit(EVT_TTS_DONE, index=index, duration=result.duration)
-            self._emit(EVT_PLAYBACK_START, index=index)
+            self._emit(EVT_TTS_DONE, {"index": index, "total": total, "duration": result.duration})
+            self._emit(EVT_PLAYBACK_START, {"index": index})
 
             completed = self.speaker.play(result.audio)
-            self._emit(EVT_PLAYBACK_DONE, index=index, completed=completed)
+            self._emit(EVT_PLAYBACK_DONE, {"index": index, "completed": completed})
 
             if not completed:
                 interrupted = True
                 stop.set()
-                self._emit(EVT_INTERRUPTED)
+                self._emit(EVT_INTERRUPTED, {})
                 break
 
         stop.set()
@@ -223,12 +236,17 @@ class VoiceAssistant:
         config: Config,
         *,
         on_event: EventCallback | None = None,
+        on_level: LevelCallback | None = None,
         idle_timeout: float = 30.0,
         wake_threshold: float | None = None,
         stop_threshold: float | None = None,
     ) -> None:
         self.config = config
         self.on_event = on_event
+        # 电平是**可选**的：不订阅就一次都不算，零开销。
+        # 界面不能自己再开一个麦克风流 —— 同一次会话里两个 InputStream
+        # 抢同一个设备，Windows 上会互相干扰。设备只能有一个持有者。
+        self.on_level = on_level
         self.idle_timeout = idle_timeout
         # 阈值作为构造参数传入。
         # 曾经的做法是在 tools 里 monkeypatch 包的命名空间，但 VoiceAssistant
@@ -239,7 +257,14 @@ class VoiceAssistant:
 
         # ---- 设备层 ----
         self.microphone = Microphone(config.audio)
-        self.speaker = Speaker(config.audio)
+        # 播放电平也回吐给界面：光球在「说话」态应当跟着真实音量脉动，
+        # 而不是放一个假的正弦波假装自己在说话
+        self.speaker = Speaker(
+            config.audio,
+            on_level=(lambda level: self._notify_level(level, "speaker"))
+            if on_level is not None
+            else None,
+        )
 
         # ---- 能力层 ----
         self.asr = SpeechRecognizer(config, on_retry=self._on_retry)
@@ -258,6 +283,17 @@ class VoiceAssistant:
         self.stats = SessionStats()
         self._running = False
         self._frames: queue.Queue = queue.Queue(maxsize=_FRAME_QUEUE_SIZE)
+
+        # ---- 表现层的输入通道（M4）----
+        # 指令队列：GUI 线程投，主循环每帧排空。见 events.py 顶部的说明。
+        self._commands: queue.Queue[str] = queue.Queue()
+        # 打字输入的内容队列。与指令分开是因为指令是「做什么」、
+        # 内容才是「说了什么」，混在一个队列里迟早会有人只投内容忘了投指令。
+        self._text_inbox: queue.Queue[str] = queue.Queue()
+        # 她正在说话时打进来的字：等播报收尾后再处理
+        self._pending_text: str | None = None
+        self._level_tick = 0
+
         self._last_activity = time.monotonic()
         # 播报的运行时状态。播报跑在独立线程里，主线程**不等待**它 ——
         # 否则就回不到主循环，「停」的检测永远不会发生。
@@ -344,6 +380,15 @@ class VoiceAssistant:
         except Exception as exc:  # 订阅方出错不该拖垮主流程
             log.warning("事件回调 %s 抛错：%s", event, exc)
 
+    def _event_sink(self, event: str, payload: dict[str, Any]) -> None:
+        """把标准 EventCallback 签名适配到内部的 _emit(事件名, **载荷)。
+
+        内部保留 **载荷 的写法是因为绝大多数调用点只关心三两个键，
+        key=value 比手写字面量字典好读；对外（_SentenceSpeaker）则统一走
+        标准签名，避免同一个项目里出现两种事件回调约定。
+        """
+        self._emit(event, **payload)
+
     def _on_retry(self, attempt: int, total: int, reason: str) -> None:
         self._emit(EVT_RETRY, attempt=attempt, total=total, reason=reason)
 
@@ -351,6 +396,205 @@ class VoiceAssistant:
         """请求退出。可以从其他线程调用。"""
         self._running = False
         self.speaker.stop()
+
+    # ══════════════════════════════════════════════════════
+    #  表现层接口（M4）—— 全部可以从其他线程调用
+    # ══════════════════════════════════════════════════════
+
+    def post(self, command: str) -> None:
+        """下达一条控制指令。可以从**任意线程**调用，立即返回。
+
+        指令名见 events.py 的 CMD_* 常量；主循环每帧排空一次队列。
+        这里刻意不做任何校验就入队 —— 校验放在主循环里做，
+        这样「未知指令」只会记一条 warning，而不会在 GUI 线程抛异常。
+        """
+        self._commands.put(command)
+
+    def submit_text(self, text: str) -> bool:
+        """把一句打字的输入交给助手，走完整的一轮对话。
+
+        返回是否已受理。内容与指令一起入队，主循环会按顺序处理。
+        """
+        text = (text or "").strip()
+        if not text:
+            return False
+        self._text_inbox.put(text)
+        self._commands.put(CMD_SUBMIT_TEXT)
+        return True
+
+    def clear_memory(self) -> None:
+        """清空对话记忆。可以从其他线程调用。
+
+        只清记忆、不动状态机：下一轮组装消息时才会读到它，
+        所以在播报中途清也是安全的。
+        """
+        self.memory.clear()
+        log.info("对话记忆已清空")
+
+    def clear_stop(self) -> None:
+        """清掉待处理的停止请求（界面点「取消」时用）。"""
+        self.speaker.clear_stop()
+
+    def set_idle_timeout(self, seconds: float) -> None:
+        """改静默超时。可以从其他线程调用。
+
+        单个 float 赋值是原子的；最坏情况是这一轮多等一帧才生效，
+        没有正确性问题。
+        """
+        self.idle_timeout = max(1.0, float(seconds))
+
+    def set_thresholds(
+        self, *, wake: float | None = None, stop: float | None = None
+    ) -> None:
+        """改唤醒 / 停阈值。
+
+        实现方式是**把检测器丢掉**，下次访问属性时按新阈值重建 ——
+        阈值是 KWS 的构造参数（写进模型的 config），没有就地修改的接口。
+
+        主循环里每次都是 self.wake.feed(...)，属性求值与使用在同一次
+        表达式里完成，所以最多有一帧被喂给旧检测器，无正确性影响。
+        """
+        if wake is not None:
+            self._wake_threshold = float(wake)
+            self._wake = None
+        if stop is not None:
+            self._stop_threshold = float(stop)
+            self._stop = None
+
+    # ---------- 电平 ----------
+
+    def _notify_level(self, level: float, source: str) -> None:
+        """把电平报给订阅方。订阅方出错不该拖垮音频链路。"""
+        hook = self.on_level
+        if hook is None:
+            return
+        try:
+            hook(level, source)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("电平回调抛错：%s", exc)
+
+    def _maybe_report_level(self, frame: bytes) -> None:
+        """限频地把麦克风电平报出去。未订阅时**连能量都不算**。
+
+        为什么限频在 L5 做而不是界面做：界面对「每帧 50 次」没有概念，
+        而这里一个计数器就够了。让调用方自己节流，迟早会有人忘了节流。
+        """
+        if self.on_level is None:
+            return
+        self._level_tick += 1
+        if self._level_tick % _LEVEL_EVERY_N_FRAMES:
+            return
+        self._notify_level(Microphone.rms(frame), "mic")
+
+    # ---------- 指令处理 ----------
+
+    def _drain_commands(self) -> None:
+        """排空指令队列。由主循环**每帧**调用。
+
+        一条指令处理失败只记日志，绝不往外抛 —— 队列循环被一个坏指令
+        打断的话，后面排队的「退出」就永远执行不到了。
+        """
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._handle_command(command)
+            except AyuanError as exc:
+                log.warning("处理指令 %s 失败：%s", command, exc)
+                self._emit(EVT_ERROR, message=str(exc), hint=getattr(exc, "hint", ""))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("处理指令 %s 出现未预料的异常", command)
+
+    def _handle_command(self, command: str) -> None:
+        if command == CMD_LISTEN:
+            self._command_listen()
+        elif command == CMD_STOP_SPEAKING:
+            self.speaker.stop()
+        elif command == CMD_SUBMIT_TEXT:
+            self._command_submit_text()
+        elif command == CMD_RESET:
+            self._command_reset()
+        elif command == CMD_SHUTDOWN:
+            log.info("收到退出指令")
+            self.stop()
+        else:
+            # 从 ALL_COMMANDS 现算而不是手写一份：手写的那份迟早和
+            # 上面的分支对不上，而错误提示恰恰是排障时唯一能看的东西
+            log.warning(
+                "未知指令：%r（合法指令：%s）", command, " / ".join(sorted(ALL_COMMANDS))
+            )
+
+    def _command_listen(self) -> None:
+        """「点击说话」：不等唤醒词，直接进入聆听。
+
+        唤醒词只认真人语音、无法用 TTS 闭环自测（见 status.md 第六节），
+        所以界面必须有一条**不依赖唤醒模型**的确定性入口 —— 排障时尤其需要。
+        """
+        if self.state is AssistantState.IDLE:
+            self.segmenter.reset()
+            self._set_state(AssistantState.LISTENING)
+            log.info("手动进入聆听（未使用唤醒词）")
+        elif self.state is AssistantState.SPEAKING:
+            # 她正在说，此时点「说话」的意图显然是「你先别说了，听我的」
+            self.speaker.stop()
+        # LISTENING：已经在听了，重复点不该有任何副作用
+        # THINKING：主循环此刻根本没在排空队列，走不到这里
+
+    def _command_submit_text(self) -> None:
+        try:
+            text = self._text_inbox.get_nowait()
+        except queue.Empty:
+            log.warning("收到打字输入指令，但内容队列是空的（指令与内容必须成对入队）")
+            return
+
+        if self.state is AssistantState.SPEAKING:
+            # 她正说着的时候打字 = 插话：先让她停下，这句话等播报收尾后再处理。
+            # 不能直接在这里 _run_turn —— 播报线程还没退出，而
+            # _speak_thread / _speak_result 是同一份字段，会被踩乱。
+            self._pending_text = text
+            self.speaker.stop()
+            log.info("正在播报，打字输入排队等待")
+            return
+
+        self._run_turn(text_override=text)
+
+    def _command_reset(self) -> None:
+        """放弃当前这一轮，回到待机。"""
+        if self.state is AssistantState.SPEAKING:
+            # 同样不硬闯：让它自然收尾，收尾逻辑会把状态放回聆听
+            self.speaker.stop()
+            return
+        self._pending_text = None
+        self.segmenter.reset()
+        self._drain_frames()
+        self._set_state(AssistantState.IDLE)
+
+    def _begin_new_session(self) -> None:
+        """把会话级状态归位，为一次新的 run() 做准备（KI-007①）。
+
+        刻意**绕过转换表**：EXITING -> IDLE 在同一会话内确实是非法转换
+        （转换表因此拒绝它），但「上一个会话已结束，现在开一个新的」
+        是合法的重置语义。写成一个具名方法而不是散在 run() 里，
+        是为了让「这里故意绕过了状态机」这件事一眼可见、且只有一处。
+
+        对话记忆**不清空** —— 关掉界面再打开，她应该还记得刚才聊了什么。
+        """
+        if self.state is AssistantState.EXITING:
+            log.info("上一个会话已结束，开始新会话")
+        self.state = AssistantState.IDLE
+        self.stats = SessionStats()
+        self._last_activity = time.monotonic()
+        # 清掉上一轮遗留的停止闭锁，否则新会话的第一句会被静默吃掉
+        self.speaker.clear_stop()
+        # 队列里可能还压着上一个会话的音频帧，带进新会话会让它「听到」旧声音
+        self._drain_frames()
+        self._drain_commands()
+        self._pending_text = None
+        self._clear_text_inbox()
+        if self._segmenter is not None:
+            self._segmenter.reset()
 
     # ══════════════════════════════════════════════════════
     #  输入线程
@@ -397,10 +641,40 @@ class VoiceAssistant:
     # ══════════════════════════════════════════════════════
 
     def run(self, *, max_turns: int | None = None) -> SessionStats:
-        """启动助手，直到收到退出指令。"""
+        """启动助手，直到收到退出指令。
+
+        **可重入**（M4 修 KI-007①）：EXITING 是会话内的终态，但再次调用
+        run() 的语义是「开一个新会话」，而不是非法转换。原实现直接把
+        EXITING -> IDLE 喂给 _set_state，第二次 run() 必然抛
+        InvalidTransition，且异常发生在 try 之外 —— 界面的「重新开始会话」
+        一按就拿到 traceback。
+        """
+        if self._running:
+            raise AyuanError(
+                "助手已经在运行中",
+                hint="同一个 VoiceAssistant 不能并发跑两个会话，请先 stop()",
+            )
+
+        # 会话级归位：不走转换表。EXITING -> IDLE 在**同一会话内**确实非法
+        # （所以才不在 ALLOWED_TRANSITIONS 里），但跨会话是合法的重置。
+        self._begin_new_session()
+
         self._running = True
-        self._set_state(AssistantState.IDLE)
-        self.microphone.open()
+        try:
+            self._set_state(AssistantState.IDLE)
+            self.microphone.open()
+        except Exception:
+            # 打开设备失败也必须把 _running 放回去（M4 审查 R2）。
+            #
+            # 原先这两行在 try 之外：open() 一抛，下面的 finally 整段跳过，
+            # _running 永远停在 True —— 这个实例就永久不可复用了。而 M4 给
+            # run() 加的并发守卫会把它变成一句「助手已经在运行中」，
+            # 用户看到的是一句和真实原因（麦克风被占用）毫无关系的报错。
+            #
+            # 这里只回滚标志位就够了：open() 失败时流是 None，
+            # 没有需要清理的设备资源（close() 自带空值保护）。
+            self._running = False
+            raise
 
         reader = threading.Thread(target=self._reader_loop, daemon=True, name="ayuan-input")
         reader.start()
@@ -408,6 +682,10 @@ class VoiceAssistant:
 
         try:
             while self._running:
+                # 指令要在取帧之前排空：否则「点击说话」这种指令会被
+                # 排在它后面的音频帧处理拖住，表现为按钮没反应。
+                self._drain_commands()
+
                 try:
                     frame = self._frames.get(timeout=0.2)
                 except queue.Empty:
@@ -448,6 +726,10 @@ class VoiceAssistant:
 
     def _tick(self, frame: bytes) -> None:
         """处理一帧。按当前状态决定这帧用来做什么。"""
+        # 电平先报：无论什么状态，麦克风都在收音，界面上都该有反应。
+        # 未订阅时这个调用什么都不做（连能量都不算）。
+        self._maybe_report_level(frame)
+
         state = self.state
 
         if state == AssistantState.IDLE:
@@ -459,7 +741,13 @@ class VoiceAssistant:
                 self._set_state(AssistantState.LISTENING)
 
         elif state == AssistantState.LISTENING:
+            was_speaking = self.segmenter.is_speaking
             segment = self.segmenter.feed(frame)
+            if not was_speaking and self.segmenter.is_speaking:
+                # EVT_SPEECH_START 原先只定义、从不发出（死常量）。
+                # 界面要它来区分「已唤醒但还没开口」和「正在说话」——
+                # 后者才该让光球的涟漪跟着音量动。
+                self._emit(EVT_SPEECH_START)
             if segment is not None:
                 self._emit(EVT_SPEECH_END, duration=segment.duration)
                 self._run_turn(segment)
@@ -473,39 +761,68 @@ class VoiceAssistant:
     #  一轮对话
     # ══════════════════════════════════════════════════════
 
-    def _run_turn(self, segment) -> TurnResult:
+    def _run_turn(self, segment=None, *, text_override: str | None = None) -> TurnResult:
+        """跑完一轮：识别（或直接采用打字文本）-> 生成 -> 启动播报。
+
+        text_override 非空时**跳过 ASR**，但下游完全共用一条路径 ——
+        打字和说话在界面上的表现因此天然一致，不必写两套渲染逻辑。
+        """
         result = TurnResult()
-        started = time.monotonic()
+        # 这里【不再】记一个 started：本方法在播报线程启动后就返回，
+        # 用它算出来的「合计」天生不完整。计时一律逐项写 timings。
 
         try:
-            # ---- 识别 ----
+            # ---- 识别（或直接采用打字的文本）----
             self._set_state(AssistantState.THINKING)
-            t0 = time.monotonic()
-            transcript = self.asr.transcribe(segment.pcm, segment.sample_rate)
-            result.timings["识别"] = time.monotonic() - t0
-            result.user_text = transcript.text
-            self._emit(
-                EVT_ASR_DONE,
-                text=transcript.text,
-                emotion=transcript.emotion,
-                elapsed=result.timings["识别"],
-            )
 
-            if transcript.is_empty:
-                log.info("没听清，回到待机")
-                self._set_state(AssistantState.IDLE)
-                return result
+            if text_override is not None:
+                result.user_text = text_override.strip()
+                result.timings["识别"] = 0.0
+                # source 把「打字」和「说话」标开：下游路径相同，
+                # 但事件日志里必须看得出来，否则排障时会怀疑麦克风
+                self._emit(
+                    EVT_ASR_DONE,
+                    text=result.user_text,
+                    emotion="",
+                    elapsed=0.0,
+                    source="typed",
+                )
+                if not result.user_text:
+                    log.info("打字输入为空，回到待机")
+                    self._set_state(AssistantState.IDLE)
+                    return result
+            else:
+                t0 = time.monotonic()
+                transcript = self.asr.transcribe(segment.pcm, segment.sample_rate)
+                result.timings["识别"] = time.monotonic() - t0
+                result.user_text = transcript.text
+                self._emit(
+                    EVT_ASR_DONE,
+                    text=transcript.text,
+                    emotion=transcript.emotion,
+                    elapsed=result.timings["识别"],
+                    source="speech",
+                )
+
+                if transcript.is_empty:
+                    log.info("没听清，回到待机")
+                    self._set_state(AssistantState.IDLE)
+                    return result
 
             # ---- 结束语 ----
-            if any(w in transcript.text for w in BYE_WORDS):
-                result.reply_text = transcript.text
+            # 打字输入同样受这句约束：打「再见」也该结束会话，
+            # 否则两条入口的行为会分叉
+            if any(w in result.user_text for w in BYE_WORDS):
+                result.reply_text = result.user_text
                 self._set_state(AssistantState.IDLE)
                 self._running = False
                 return result
 
             # ---- 生成 ----
             t0 = time.monotonic()
-            reply = self.llm.reply(transcript.text, self.memory)
+            # 用 result.user_text 而不是 transcript.text：打字输入没有 transcript，
+            # 而两条入口之后的所有逻辑都必须共用同一份「用户说了什么」
+            reply = self.llm.reply(result.user_text, self.memory)
             result.timings["对话"] = time.monotonic() - t0
             result.reply_text = reply.text
             self._emit(
@@ -554,7 +871,10 @@ class VoiceAssistant:
             if self.state not in (AssistantState.EXITING,):
                 self._set_state(AssistantState.IDLE)
 
-        result.timings["合计"] = time.monotonic() - started
+        # 【刻意不存 timings["合计"]】
+        # _run_turn 在播报线程启动后就返回了，此刻「播报」这一项还没写完；
+        # 存下来的合计既漏掉播报，又会在 timing_summary() 求和时被再加一遍
+        # —— 与 M2 审查 B2 是同一类矛盾。合计一律由 timing_summary() 现算。
         return result
 
     def _start_speaking(self, sentences: list[str], result: TurnResult) -> None:
@@ -577,9 +897,10 @@ class VoiceAssistant:
         self._speak_started = time.monotonic()
 
         def work() -> None:
-            speaker = _SentenceSpeaker(self.tts, self.speaker, self._emit)
+            speaker = _SentenceSpeaker(self.tts, self.speaker, self._event_sink)
             try:
-                box["result"] = speaker.run(iter(sentences))
+                # 传快照：run() 现在需要 len() 才能发出 tts_done 的 total
+                box["result"] = speaker.run(list(sentences))
             except BaseException as exc:  # noqa: BLE001 — 交给主线程统一处理
                 box["error"] = exc
 
@@ -641,6 +962,29 @@ class VoiceAssistant:
         else:
             # 回到聆听 —— 这是「连续对话」的关键：不必再喊唤醒词
             self._set_state(AssistantState.LISTENING)
+
+        # 播报期间打进来的字，到这里才处理。
+        # 时机放在状态已经落到聆听之后：_run_turn 的第一步是转到思考，
+        # 而从聆听出发才是表里认可的路径。
+        pending = self._pending_text
+        self._pending_text = None
+        if pending is not None and error is None:
+            log.info("处理播报期间排队的打字输入")
+            self._run_turn(text_override=pending)
+        elif pending is not None:
+            log.warning("上一轮出错，丢弃排队的打字输入")
+
+    def _clear_text_inbox(self) -> None:
+        """丢弃排队的打字输入（新会话开始时）。"""
+        dropped = 0
+        while True:
+            try:
+                self._text_inbox.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        if dropped:
+            log.debug("丢弃排队的打字输入 %d 条", dropped)
 
     def _drain_frames(self) -> None:
         """丢弃积压的音频帧。

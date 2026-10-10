@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
 from app.audio.capture import Microphone
 from app.audio.player import Speaker, parse_audio
+from app.audio.wav import pcm_rms
 from app.config import AudioSettings
 
 
@@ -96,3 +99,145 @@ class TestSpeakerBeep:
             speaker.beep(duration=duration)
             # 极短时长允许不发声（返回空），但绝不能抛异常
             assert len(audio) <= 1
+
+def _devicefree_speaker(blocks: int = 4, stop_at: int | None = None):
+    """造一个不碰硬件的 Speaker。
+
+    用 __new__ 绕过 __init__（不解析真实音频设备），补上 play() 需要的
+    运行时字段，再替换 _play_loop 成分块假播放。返回 (扬声器, 已播块号)。
+
+    stop_at 指定在第几块之后调用 stop()，用来模拟「播放途中用户喊停」。
+    """
+    speaker = Speaker.__new__(Speaker)
+    speaker.settings = AudioSettings()
+    speaker._stop_event = threading.Event()
+    speaker._playing = threading.Event()
+    speaker._lock = threading.Lock()
+    speaker._on_level = None
+    speaker._level_tick = 0
+    played: list[int] = []
+
+    def fake_play_loop(pcm, rate, channels) -> None:
+        for index in range(blocks):
+            if speaker._stop_event.is_set():
+                return
+            played.append(index)
+            if stop_at is not None and index == stop_at:
+                speaker.stop()
+
+    speaker._play_loop = fake_play_loop  # type: ignore[method-assign]
+    return speaker, played
+
+
+class TestSpeakerStopLatch:
+    """KI-007②：句间窗口发出的「停」不能被静默丢掉。
+
+    修复前 stop() 只在 _playing 已置位时才置位停止事件，而 play() 入口
+    又会 clear() 它 —— 于是「上一句刚播完、下一句还没开始」那一小段窗口里
+    发出的停止请求会被丢掉：用户喊了「停」，她 200ms 后接着念下一句。
+    """
+
+    def test_stop_before_play_skips_the_utterance(self) -> None:
+        speaker, played = _devicefree_speaker()
+        speaker.stop()          # 句间窗口发出的停止请求
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert played == [], "一个字都不该播"
+        assert speaker.is_playing is False, "跳过时不该留下播放中的状态"
+
+    def test_latch_is_consumed_by_the_next_play(self) -> None:
+        """闭锁只作用于当前这一段，不能把后续每一次播放都吃掉。"""
+        speaker, played = _devicefree_speaker()
+        speaker.stop()
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played, "第二段应当正常播放"
+
+    def test_clear_stop_reenables_playback(self) -> None:
+        speaker, played = _devicefree_speaker()
+        speaker.stop()
+        speaker.clear_stop()    # 新一段播报 / 新会话开始
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played
+
+    def test_stop_during_playback_still_interrupts(self) -> None:
+        speaker, played = _devicefree_speaker(blocks=4, stop_at=1)
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert played == [0, 1], f"应当在第 2 块后停下，实际播了 {played}"
+
+    def test_full_playback_returns_true(self) -> None:
+        speaker, played = _devicefree_speaker(blocks=3)
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played == [0, 1, 2]
+
+    def test_empty_audio_is_a_noop_success(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        assert speaker.play(b"") is True
+
+    def test_stop_latches_when_idle(self) -> None:
+        """空闲时也要置位 —— 这正是修复点。"""
+        speaker, _ = _devicefree_speaker()
+        assert speaker._stop_event.is_set() is False
+        speaker.stop()
+        assert speaker._stop_event.is_set() is True
+
+class TestPcmRms:
+    """共享的电平计算。麦克风与扬声器两侧都用它驱动界面波形。"""
+
+    def test_empty_is_zero(self) -> None:
+        assert pcm_rms(b"") == 0.0
+
+    def test_odd_length_is_truncated_not_raised(self) -> None:
+        """np.frombuffer 遇奇数字节抛裸 ValueError，不属于 AyuanError 家族。
+
+        M1 审查已经因为这个坑修过一次 Microphone.rms —— 新加的这份
+        实现必须同样安全，否则等于把修好的坑在另一处重新挖开。
+        """
+        assert pcm_rms(b"\x01") == 0.0
+        assert pcm_rms(b"\x01\x02\x03") > 0.0
+
+    def test_silence_is_zero(self) -> None:
+        assert pcm_rms(b"\x00" * 640) == 0.0
+
+    def test_louder_signal_has_higher_level(self) -> None:
+        quiet = np.full(320, 100, dtype=np.int16).tobytes()
+        loud = np.full(320, 8000, dtype=np.int16).tobytes()
+        assert pcm_rms(loud) > pcm_rms(quiet) > 0.0
+
+    def test_full_scale_is_one(self) -> None:
+        peak = np.full(320, 32767, dtype=np.int16).tobytes()
+        assert pcm_rms(peak) == pytest.approx(1.0, abs=1e-3)
+
+    def test_agrees_with_microphone_rms(self) -> None:
+        pcm = np.arange(-500, 500, dtype=np.int16).tobytes()
+        assert pcm_rms(pcm) == pytest.approx(Microphone.rms(pcm))
+
+
+class TestSpeakerLevelReporting:
+    """播放电平回吐给界面，让光球跟着真实音量脉动而不是放个假正弦波。"""
+
+    def test_no_hook_is_a_noop(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        assert speaker._on_level is None
+        for _ in range(5):
+            speaker._report_level(b"\x00" * 640)
+
+    def test_levels_are_throttled(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        seen: list[float] = []
+        speaker._on_level = seen.append
+
+        for _ in range(6):
+            speaker._report_level(b"\x00" * 640)
+
+        assert len(seen) == 2, f"每 3 块报一次，6 块应当报 2 次，实际 {len(seen)}"
+
+    def test_a_failing_hook_does_not_break_playback(self) -> None:
+        speaker, _ = _devicefree_speaker()
+
+        def boom(level: float) -> None:
+            raise RuntimeError("界面代码炸了")
+
+        speaker._on_level = boom
+        for _ in range(4):
+            speaker._report_level(b"\x00" * 640)   # 不该往外抛
+

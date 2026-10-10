@@ -29,6 +29,10 @@
 | 唤醒方案 | sherpa-onnx KWS（**不是** Vosk+拼音匹配） | 「阿源」只有 2 音节，拼音匹配会被「原来/员工/原因」频繁误触发 |
 | 唤醒词 | `ā y uán @阿源`，阈值 0.2 | token 写法是穷举试出来的，见第六节 |
 | UI（M4） | PySide6，脸谱式主界面 + 右侧对话历史 | 用户选定 |
+| 界面实现 | **QPainter 纯代码自绘**光球，零美术素材 | 项目没有任何图片资源，且四态要连续插值（切图会跳变） |
+| Qt 依赖 | **PySide6-Essentials**，不是完整 PySide6 | 完整包多拖 WebEngine 131.7MB + Addons 40.5MB，一行都用不到 |
+| UI 线程模型 | **命令进队列 / 事件出信号** | Qt 规定控件只能在 GUI 线程碰，而 L5 的回调来自三个线程 |
+| 设置持久化 | 行级改写 `.env`，且**必须显式点按钮** | `.env` 里有密钥，静默改写它不可接受 |
 | 音频路由 | 内置麦克风收音 + 蓝牙耳机放音 | 蓝牙耳机兼任麦克风会切免提模式，音质骤降 |
 | 人设 | 女，知心知性、阳光开朗，外在大大咧咧、实则心思细腻 | 见 `app/capabilities/llm.py` 的 SYSTEM_PROMPT |
 | 未来本地模型 | 预留 OpenAI 兼容接口（WSL2 + Ollama/vLLM） | 换 `base_url` 即可，上层不动 |
@@ -54,19 +58,25 @@
 | M1 | 工程骨架 · L1 基础层 · L2 设备层 · 环境自检 | ✅ 已完成（PR #1/#2/#3） |
 | M2 | L4 能力层（ASR/LLM/TTS）· L5 单轮流水线 | ✅ 已完成（PR #4） |
 | M3 | L3 感知层 · L5 状态机 + 连续对话 + 打断 + 边说边播 | ✅ 已完成（PR #5） |
-| **M4** | **L6 表现层：PySide6 桌面界面** | ⏳ **下一个** |
-| M5 | 视觉理解 + Agent 工具池 + 打包 + **交接文档** | ⏳ 计划中 |
+| M4 | L6 表现层：PySide6 桌面界面 | ✅ 已完成（已并入 main） |
+| **M5** | **视觉理解 + Agent 工具池 + 打包 + 交接文档** | ⏳ **下一个** |
 
-**测试**：165 条全部通过，`pytest -q` 直接跑。
+**测试**：372 条全部通过，`pytest -q` 直接跑。
+**界面**：`python -m app.ui` —— 脸谱式光球 / 对话历史 / 技术面板 / 托盘 / 设置。
 **审查**：每个里程碑完成后派独立子智能体审查，报告存档在 `docs/reviews/`。
+M4 报告见 [reviews/m4-review.md](reviews/m4-review.md)：1 个 🔴 + 3 个 🟡 + 6 个 🟢。
+**🔴 R1（有托盘时退出不退进程）与 R2 / A1 / R4 已修**；
+其余未修的已按流程记入 [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) 的 KI-008 ~ KI-011。
+**M5 不做独立审查**（项目所有者决定，M5 之后项目收工）。
 
 ---
 
 ## 五、分层架构
 
 ```
-L6 表现层   app/ui/             （M4）
-L5 编排层   app/orchestrator/   pipeline.py(M2) + states.py + assistant.py(M3)
+L6 表现层   app/ui/             app.py + main_window + orb + history + tech_panel
+                                + settings_panel + tray + controller + bridge
+L5 编排层   app/orchestrator/   events.py(契约) + pipeline.py(M2) + states.py + assistant.py(M3)
 L4 能力层   app/capabilities/   base / asr / llm / tts
 L3 感知层   app/perception/     vad / segmenter / wakeword
 L2 设备层   app/audio/          capture / player / devices / wav
@@ -100,11 +110,36 @@ L1 基础层   app/core/ + app/config.py
 12. 输入线程结束**未必是异常**（`frames()` 读空到上限会正常 return），必须在 `finally` 里判定「为什么结束」，否则助手静默挂死。
 13. 静默超时要**每帧**检查，不能只在队列空时检查。
 
+### 表现层（M4）
+18. **PySide6 + conda 会加载失败**：6.12 的 wheel 不再自带 ICU，而 conda 的
+    `Library\bin\icuuc.dll` 只导出带版本后缀的 `ucnv_open_73`，Qt6Core 要的是
+    无后缀的 `ucnv_open` —— 一共缺 20 个符号，整个 QtCore 加载失败。
+    修法见 `app/ui/qt_runtime.py`（在任何 Qt import 之前预加载 System32 的 ICU）。
+19. **跨线程刷 Qt 控件必崩，而且崩在随机位置**。槽函数**必须**连到 QObject 的
+    绑定方法上；连 lambda 时 Qt 无从判断接收者归属，会退化成直连、
+    在发射线程里执行。`bridge.gui_thread` 把这条变成第一次触发就报错的断言。
+20. **光晕与涟漪会溢出控件被裁成方形暗边** —— 代码里完全看不出来，
+    把四态渲染成 PNG 才发现的。现在球体尺寸从动效表**推导**出来
+    （`MAX_RADIUS_RATIO = 1 / MAX_EXTENT_RATIO`），调幅度不会再撑出边界。
+21. **offscreen 平台没有字体库**，中文会渲染成豆腐块。别把它当成「缺字形」——
+    正式平台上实测 386 个字体、Microsoft YaHei UI 命中、「聆听中」宽 60px。
+    离屏渲染只用来看版式，不看文字。
+22. **打字输入必须由事件流驱动**：界面自己往历史里加一条，编排层随后又发
+    `asr_done`，结果是两个一模一样的用户气泡。重复记账是最容易埋的一类 bug。
+23. **不要让控件去猜数据的结构**（例如「从第几行开始是参数」）——
+    控制器按**分区**返回 `[("设备", [...]), ("参数", [...])]`，
+    耦合少一处，改错的机会就少一次。
+
 ### 工程
-14. **`.bat` 必须纯 ASCII + CRLF**（cmd.exe 用 OEM 代码页读，UTF-8 中文会撕裂命令）。
-15. **测试桩帧内容要可识别** —— 全是全零字节时，「同一帧被拼两遍」物理上看不出来。
-16. **异常必须属于 `AyuanError` 家族** —— 裸异常会穿透上层容错。
-17. **TypeScript 模板字符串里不能出现字面反引号** —— 记录文档时用单引号数组 join，否则工具链解析失败（本项目已踩多次）。
+24. **`.bat` 必须纯 ASCII + CRLF**（cmd.exe 用 OEM 代码页读，UTF-8 中文会撕裂命令）。
+25. **测试桩帧内容要可识别** —— 全是全零字节时，「同一帧被拼两遍」物理上看不出来。
+26. **异常必须属于 `AyuanError` 家族** —— 裸异常会穿透上层容错。
+27. **测试替身不许比真实实现宽松** —— FakeSpeaker 原先在 play() 入口无条件
+    `clear()`，恰好把要修的 bug 演成了「预期行为」。
+28. **窗口模态框会让离屏测试直接挂死** —— 清理阶段的 `close()` 会弹确认框，
+    测试要嘛走「跳过确认」的真实路径，要嘛替换掉 QMessageBox。
+29. **TypeScript 模板字符串里不能出现字面反引号** —— 记录文档时用单引号数组 join，
+    否则工具链解析失败（本项目已踩多次）。同理 `${...}` 会被当插值。
 
 ---
 
@@ -124,8 +159,10 @@ L1 基础层   app/core/ + app/config.py
 ## 八、常用命令
 
 ```bash
-.venv\Scripts\python.exe -m pytest -q               # 跑测试（165 条）
-.venv\Scripts\python.exe tools\m3_assistant.py      # 免按钮语音对话（主入口）
+.venv\Scripts\python.exe -m pytest -q               # 跑测试（372 条）
+.venv\Scripts\python.exe -m app.ui                  # 图形界面（M4 起的主入口）
+.venv\Scripts\python.exe -m app.ui --no-session -v  # 只开界面，调版式用
+.venv\Scripts\python.exe tools\m3_assistant.py      # 免按钮语音对话（命令行入口）
 .venv\Scripts\python.exe tools\m2_chat.py --text    # 纯文字对话（免麦克风）
 .venv\Scripts\python.exe tools\check_env.py         # 环境自检
 .venv\Scripts\python.exe -m app.main                # 项目体检面板
@@ -135,13 +172,19 @@ L1 基础层   app/core/ + app/config.py
 
 ---
 
-## 九、下一步（M4）
+## 九、下一步（M5）
 
-**PySide6 桌面界面**，用户已选定形态：
-- 主界面：脸谱式 —— 中央一个随状态变化的头像/光球（待机 / 聆听 / 思考 / 说话）
-- 右侧：对话历史（可查看）
-- 展开式技术面板（波形、设备、参数）
+**M4 已交付**（设计方案见 [design/m4-ui-design.md](design/m4-ui-design.md)）：
+脸谱式光球（QPainter 自绘，四态各有动作语言）+ 对话历史气泡 + 文本输入
++ 技术面板（电平波形 / 设备 / 参数 / 事件日志）+ 设置面板（可写回 .env）
++ 系统托盘 + 关窗三选一。顺手收敛了 KI-006（统一事件契约）与 KI-007。
 
-**开工前应先出设计方案给用户确认**，再动手。
+**M5 待办**：
+- 视觉理解（说「看看这是什么」触发拍照 → `qwen3-vl-plus`）
+- Agent 工具池（天气，`WEATHER_API_KEY` 已预留）
+- 打包分发（PySide6-Essentials 已经为此把体积压下来了）
+- **面向接手开发者的交接文档**（目标是「新人看完就能接手」）
 
-**M5 待办**：视觉理解（说「看看这是什么」触发拍照）· Agent 工具池（天气）· 打包分发 · **面向接手开发者的交接文档**（目标是「新人看完就能接手」）。
+**M5 开工前记得**：界面的设置面板已经占住了 `.env` 的三个键
+（`AYUAN_WAKE_THRESHOLD` / `AYUAN_STOP_THRESHOLD` / `AYUAN_IDLE_TIMEOUT`），
+新增配置项时沿用 `config.update_env_file()`，别另造一套写盘逻辑。

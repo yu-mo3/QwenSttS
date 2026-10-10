@@ -88,29 +88,85 @@
 
 ---
 
-### KI-006 · 编排层的事件定义重复、载荷不一致
+### ~~KI-006 · 编排层的事件定义重复、载荷不一致~~ ✅ M4 已解决
 
 | 项 | 内容 |
 |---|---|
 | **来源** | M3 审查 · X14 / X15（🟢 可以不管） |
-| **位置** | `app/orchestrator/pipeline.py` 与 `assistant.py` |
-| **问题** | ① 事件常量、`EventCallback`、`TurnResult` 各定义一份；② 同名事件 `tts_done` 的载荷不一致（pipeline 带 `total`，assistant 不带）；③ `assistant` 里有只写不读的字段 |
-| **影响** | 无功能影响。但 **M4 的 UI 若统一订阅事件、又依赖 `payload['total']`，会 KeyError** |
-| **为什么不修** | 两个编排器当前各自独立可用；抽公共模块要动 M2 已在用的代码，收益低于风险 |
-| **何时重做** | **M4 做界面时一并处理** —— 那时会有统一的订阅层，正好借机收敛事件定义 |
+| **原问题** | ① 事件常量、`EventCallback`、`TurnResult` 各定义一份；② 同名事件 `tts_done` 的载荷不一致（pipeline 带 `total`，assistant 不带） |
+| **何时重做** | 原计划「M4 做界面时一并处理」 |
+| **✅ 结果** | M4-1 抽出 `app/orchestrator/events.py`：事件名 + 载荷契约 + `EventCallback` + 共用 `TurnResult` 全部收敛。assistant 的 `tts_done` 补上 `total` |
+| **怎么防止再漂移** | 光靠「记得同步改」是靠不住的。新增 21 条契约测试，用 **ast 静态扫描**两个编排器的每一次 `_emit`，逐个比对载荷键；另有一条断言「定义了却从不发出的事件」—— 这条当场就抓出了 M3 遗留的死常量 `EVT_SPEECH_START` |
+| **回归测试** | `tests/test_events_pure.py`（21 条） |
 
 ---
 
-### KI-007 · run() 不可重入等 API 层面小坑
+### ~~KI-007 · run() 不可重入等 API 层面小坑~~ ✅ M4 已解决
 
 | 项 | 内容 |
 |---|---|
 | **来源** | M3 审查 · X16（🟢 可以不管） |
-| **位置** | `app/orchestrator/assistant.py` / `app/audio/player.py` |
-| **问题** | ① `run()` 第二次调用会抛 `InvalidTransition`（退出 → 待机），且它在 `try` 之外、不属于 `AyuanError`；② `Speaker.stop()` 不闭锁，句间窗口发出的停止请求会被 `play()` 入口的 `clear()` 吞掉；③ `default_config(config=...)` 的 config 参数未使用 |
-| **影响** | 正常用法（一次会话一次 `run()`）不受影响 |
-| **为什么不修** | ② 在实测中未造成可感知问题（播报中调 stop 是有效的）；①③ 属于 API 洁癖 |
-| **何时重做** | M4 需要「重新开始会话」或「暂停/恢复」时 |
+| **原问题** | ① `run()` 第二次调用抛 `InvalidTransition`（退出 → 待机），且异常在 `try` 之外、不属于 `AyuanError`；② `Speaker.stop()` 不闭锁，句间窗口发出的停止请求被 `play()` 入口的 `clear()` 吞掉 |
+| **何时重做** | 原计划「M4 需要重新开始会话时」 |
+| **✅ 结果** | ① `run()` 可重入：EXITING → IDLE 交给 `_begin_new_session()`，不再喂给转换表（同一会话内它确实非法，跨会话则是合法的重置语义）；并发调用明确报 `AyuanError`；`InvalidTransition` 归入 `AyuanError` 家族 ② `Speaker.stop()` 改为无条件闭锁，由 `play()` 入口消费或 `clear_stop()` 清除 |
+| **回归测试** | `test_assistant_pure.py::TestRunReentrancy`、`test_audio_pure.py::TestSpeakerStopLatch`（7 条） |
+
+---
+
+### KI-008 · restart() 会在 GUI 线程同步阻塞最多 3 秒
+
+| 项 | 内容 |
+|---|---|
+| **来源** | M4 独立审查 · R3（🟡） |
+| **级别** | 🟡 应修 |
+| **位置** | `app/ui/controller.py` · `restart()` / `apply_devices()`；调用方 `app/ui/tray.py`、`app/ui/settings_panel.py` |
+| **问题** | `restart()` → `wait_stopped()` → `thread.join(3.0)`，而它由托盘 QAction 与设置面板按钮直接调用，都在 **GUI 线程**。会话正在 ASR/LLM 里时，实测阻塞 3.02 秒 |
+| **影响** | 点一下界面冻结 3 秒，Windows 会把窗口标成「未响应」 |
+| **为什么不修** | 会话几乎总是很快退出（`stop()` 置位后主循环一次迭代就结束），3 秒是**上限而不是常态**。真正的修法要引入「异步重启 + 完成回调」，把 `restart()` 从一个同步方法改成状态机 —— 对「换设备/重开会话」这种低频操作，复杂度与收益不成比例 |
+| **何时重做** | 实测中真的出现「未响应」白屏时；或 M5 打包后发现冷启动本身就慢，值得一并优化 |
+| **备注** | M5 打包后要走一次真实冷启动与换设备流程，顺便观察这里 |
+
+---
+
+### KI-009 · 错误提示会把 hint 显示两遍
+
+| 项 | 内容 |
+|---|---|
+| **来源** | M4 作者自查 · A2（🟡） |
+| **级别** | 🟡 应修 |
+| **位置** | `app/ui/controller.py` · `_run()`；同源问题也在 `app/orchestrator/assistant.py`、`app/orchestrator/pipeline.py` |
+| **问题** | `AyuanError.__str__` 会把 hint 拼进 message（`f"{message}（{hint}）"`），而各处又单独发一次 hint。界面上于是显示成：<br>`❌ 云端返回错误（HTTP 401）（API Key 无效或已过期）`<br>`API Key 无效或已过期` |
+| **影响** | 报错框里同一句话出现两次，看着像程序坏了。**不影响功能** |
+| **为什么不修** | 要改就得决定「`str(exc)` 到底该不该带 hint」——而这会牵动 M2/M3 就已在用的日志输出与三处异常分发。当前行为不算错，只是重复 |
+| **何时重做** | 下次动错误展示时一并处理（改 `controller._run` 用 `exc.message` 而不是 `str(exc)` 即可，但要同步看另外两处） |
+
+---
+
+### KI-010 · .env 行级回写的几个边角
+
+| 项 | 内容 |
+|---|---|
+| **来源** | M4 独立审查 · R6（🟢） |
+| **级别** | 🟢 建议 |
+| **位置** | `app/config.py` · `update_env_file()` |
+| **问题** | 四个边角（审查者实跑记录）：<br>① **BOM 开头**的 .env 认不出已有键 → 追加一行**重复键**<br>② 无 BOM 的 **LF 文件**被整体改写成 CRLF<br>③ `export KEY=` 行的 `export ` 前缀被吃掉<br>④ 替换失败（只读文件）会留下含**完整内容（含密钥）**的 `<name>.tmp` |
+| **影响** | 都不影响当前用法：真实 `.env` 无 BOM；`.env.tmp` 已被 `.env.*` 忽略；重复键需要有人手工写重复行 |
+| **为什么不修** | 属于「承诺比实现更绝对」，不是故障。①③ 需要有人真的那么写文件；② 是 `splitlines()` 的固有行为 |
+| **何时重做** | 真的收到「设置保存后启动异常」的反馈时 |
+| **备注** | ④ 稍微值得留意：只读场景下会短暂在磁盘上留一份带密钥的副本。当前 `on_save` 已捕获 `OSError` 并提示，原文件不被破坏 |
+
+---
+
+### KI-011 · 另有三条 🟢 记录在案但不打算动
+
+| 项 | 内容 |
+|---|---|
+| **来源** | M4 独立审查 · R7 / R8，以及作者自查的 app/ui 注释表述 |
+| **级别** | 🟢 建议 |
+| **问题** | ① **R7**：`SUBSCRIBED_EVENTS` 里 5 个事件没有专门信号，只进技术面板原始日志 —— 这是「事件日志留全量」的设计本意，**不是缺陷**<br>② **R8**：README 三处小出入 —— 说「内置 4 个调试配置」实际 11 个；说 `app/main.py` 是 F5 默认入口（M4 起默认是界面）；对比表写「asyncio + Qt 信号槽」而 `app/` 里 `asyncio` 只出现在 logger 静音名单<br>③ `app/ui/__init__.py` 自称「只有 controller.py 允许 import 编排层」，实际 theme/orb/tray/main_window 都 import 了 `states`（那是契约模块，正当使用） |
+| **影响** | 读到的人会找错入口 / 误判技术栈；注释与代码不符 |
+| **为什么不修** | ②③ 是文档措辞，不影响任何行为；① 本就符合设计 |
+| **何时重做** | M5 收尾做「文档收口」时顺手改 —— 那一步本来就要通读一遍 README |
 
 ---
 ## 已修复（留存索引）
@@ -132,3 +188,6 @@
 | M3 审查 X4 | 静默超时从不触发 | `test_assistant_pure.py::TestIdleTimeout` |
 | M3 审查 X6 | `--threshold` 是静默空操作 | `test_assistant_pure.py::TestThresholdParameter` |
 | M3 审查 X8 | 合成全空被当成成功 | `test_assistant_pure.py::TestEmptySynthesis` |
+| M4 自查 | 打字发送后用户气泡出现两次（界面与事件流各记一笔） | `test_ui_pure.py::TestInputRow::test_sending_does_not_double_up_the_bubble` |
+| M4 自查 | 光晕与涟漪溢出控件被裁成方形暗边 | `test_ui_pure.py::TestOrbFitsInsideItsWidget`（3 条） |
+| M4 自查 | `timings["合计"]` 被存下来又被求和，合计虚高 | `test_events_pure.py::test_orchestrators_never_store_the_timing_total` |

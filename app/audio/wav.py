@@ -24,6 +24,8 @@ import io
 import wave
 from dataclasses import dataclass
 
+import numpy as np
+
 # RIFF 文件头长度：'RIFF' + size(4) + 'WAVE'
 _RIFF_HEADER = 12
 
@@ -142,3 +144,22 @@ def pcm_duration(pcm: bytes, sample_rate: int, *, channels: int = 1, sample_widt
     if frame_size <= 0 or sample_rate <= 0:
         return 0.0
     return (len(pcm) // frame_size) / sample_rate
+
+
+def pcm_rms(pcm: bytes, *, sample_width: int = 2) -> float:
+    """裸 PCM 的均方根振幅（0~1）。
+
+    麦克风采集与扬声器播放都要拿它驱动界面上的电平波形 —— 放在这里
+    是为了两边共用一份实现（各写一份迟早会在「奇数字节怎么办」上分叉）。
+
+    **对任意字节长度都安全**：空、奇数字节一律截断而不抛异常。
+    np.frombuffer 遇奇数字节会抛裸 ValueError，它不属于 AyuanError 家族，
+    上层按设备异常写的容错兜不住 —— 这个坑 M1 审查已经踩过一次。
+    """
+    usable = len(pcm) - (len(pcm) % sample_width)
+    if usable <= 0:
+        return 0.0
+    samples = np.frombuffer(pcm[:usable], dtype=np.int16).astype(np.float32)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples**2)) / 32768.0)
