@@ -23,7 +23,6 @@ if not defined BASEPY (
 
 if not defined BASEPY (
     echo   [!] Python 3.11 / 3.12 not found.
-    echo       Python 3.13+ is NOT supported - no wheels for vosk / webrtcvad.
     echo       Please install Python 3.12 and run this script again.
     echo.
     pause
@@ -32,6 +31,21 @@ if not defined BASEPY (
 
 echo   [1/3] Interpreter : %BASEPY%
 %BASEPY% --version
+
+REM Must verify the version, not just that the file exists: an Anaconda
+REM 3.13 on D: would silently produce a venv that cannot install
+REM vosk / webrtcvad / pyaudio, and the error would only surface later
+REM at "pip install" with a confusing message.
+%BASEPY% -c "import sys; sys.exit(0 if sys.version_info[:2] in ((3,11),(3,12)) else 1)"
+if errorlevel 1 (
+    echo.
+    echo   [!] Unsupported Python version.
+    echo       This project needs Python 3.11 or 3.12.
+    echo       Python 3.13+ has no wheels for vosk / webrtcvad / pyaudio.
+    echo.
+    pause
+    exit /b 1
+)
 echo.
 
 echo   [2/3] Creating virtual environment .venv ...
@@ -62,7 +76,8 @@ echo   Setup complete.
 echo.
 echo   Next steps:
 echo     1. Copy  .env.example  to  .env  and fill in DASHSCOPE_API_KEY
-echo     2. Double-click  run.bat
+echo     2. Double-click  run.bat  to run the environment self-check
+echo     3. Run  python tools/m2_chat.py  to talk to her
 echo ============================================================
 echo.
 pause
