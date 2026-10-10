@@ -59,6 +59,45 @@
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
+      "name": "🗣️ 阿源（免按钮对话）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/m3_assistant.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
+      "name": "🔔 唤醒词验证",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/wake_test.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
+      "name": "⬇️ 下载唤醒模型",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/download_models.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": [
+        "--check"
+      ]
+    },
+    {
+      "name": "💬 M2 语音对话（单轮）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/m2_chat.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
     }
   ]
 }

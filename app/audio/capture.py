@@ -43,6 +43,7 @@ class Microphone:
         self._device_index: int | None = None
         self._device_resolved = False
         self._stream: sd.InputStream | None = None
+        self._overflow_count = 0
 
     # ---------- 设备 ----------
 
@@ -130,7 +131,13 @@ class Microphone:
         except Exception as exc:
             raise AudioDeviceError("读取麦克风数据失败", hint=str(exc)) from exc
         if overflowed:
-            log.warning("音频输入溢出，已丢弃部分数据（通常是主线程被阻塞）")
+            # 限流：常驻助手用独立线程读帧、主线程在识别/播报时会短暂不消费，
+            # 溢出属于预期现象。每次都警告会把终端刷满，反而淹没真正的问题。
+            self._overflow_count += 1
+            if self._overflow_count == 1:
+                log.warning("音频输入溢出（后续同类警告将降为 debug）")
+            else:
+                log.debug("音频输入溢出 x%d", self._overflow_count)
         return np.asarray(data, dtype=np.int16)
 
     def frames(

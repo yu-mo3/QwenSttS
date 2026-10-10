@@ -83,12 +83,25 @@ class SpeechSegmenter:
         min_speech_ms: int = DEFAULT_MIN_SPEECH_MS,
         max_speech_ms: int = DEFAULT_MAX_SPEECH_MS,
     ) -> None:
+        # 参数自洽校验：最长时长若短于最短时长，语音段永远无法产出，
+        # 而且失败得毫无痕迹（_finish 会把每段都当"过短"丢掉）。
+        # 这个组合是在写测试时才意识到的，与其让它静默失效，不如拒绝构造。
+        if max_speech_ms <= min_speech_ms:
+            raise ValueError(
+                f"max_speech_ms({max_speech_ms}) 必须大于 min_speech_ms({min_speech_ms})，"
+                "否则任何语音段都会被判定为过短而被丢弃"
+            )
+
         self.vad = vad
         self.frame_ms = vad.frame_ms
         self.speech_window = speech_window
         self.silence_window = silence_window
         self.pre_buffer = pre_buffer
         self.post_buffer = post_buffer
+        # 这两个毫秒值也要留一份：_finish() 打日志时要用，
+        # 之前只存了帧数，达到录音上限时会 AttributeError
+        self.min_speech_ms = min_speech_ms
+        self.max_speech_ms = max_speech_ms
         self.min_speech_frames = max(1, int(min_speech_ms / self.frame_ms))
         self.max_speech_frames = max(1, int(max_speech_ms / self.frame_ms))
         self._state = _State()
