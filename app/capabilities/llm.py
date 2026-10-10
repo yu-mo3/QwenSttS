@@ -38,6 +38,10 @@ log = get_logger(__name__)
 #  人设
 # ══════════════════════════════════════════════════════════
 
+# 单次请求携带的历史字符上限。人设要求「不超过三句话」，正常回复 30~60 字，
+# 4000 字足够放下十几轮；一旦某轮异常冗长，会自动从最旧的轮开始丢弃。
+DEFAULT_CHAR_BUDGET = 4000
+
 SYSTEM_PROMPT = """你叫阿源，是一位聪明、亲切的智能语音助手。
 
 【你的性格】
@@ -90,10 +94,30 @@ class ConversationMemory:
     def turn_count(self) -> int:
         return len(self._turns)
 
-    def build_messages(self, user_text: str) -> list[dict[str, str]]:
-        """拼出发给模型的消息列表。"""
+    def build_messages(
+        self,
+        user_text: str,
+        *,
+        char_budget: int = DEFAULT_CHAR_BUDGET,
+    ) -> list[dict[str, str]]:
+        """拼出发给模型的消息列表。
+
+        char_budget 是**字符预算**，而不只是轮数上限：只限轮数挡不住
+        「某一轮模型突然写了两千字」—— 10 轮 x 2000 字 约等于每次请求 15k tokens，
+        又慢又贵，而且没有刹车。这里从最旧的轮开始砍，直到落进预算。
+        """
+        turns = list(self._turns)
+        # system prompt 与本次用户输入也要计入预算 —— 它们同样占用 token，
+        # 只算历史轮会让实际请求超出预期
+        fixed = len(self.system_prompt) + len(user_text)
+        while turns:
+            used = fixed + sum(len(u) + len(a) for u, a in turns)
+            if used <= char_budget:
+                break
+            turns.pop(0)
+
         messages = [{"role": "system", "content": self.system_prompt}]
-        for prev_user, prev_assistant in self._turns:
+        for prev_user, prev_assistant in turns:
             messages.append({"role": "user", "content": prev_user})
             messages.append({"role": "assistant", "content": prev_assistant})
         messages.append({"role": "user", "content": user_text})
@@ -104,8 +128,10 @@ class ConversationMemory:
 #  分句
 # ══════════════════════════════════════════════════════════
 
-# 强语气停顿：遇到就该切句
-_STRONG_END = "。！？!?～~…"
+# 强语气停顿：遇到就该切句。
+# 必须包含英文句点 —— 阿源会答技术问题（模型名、变量名），
+# 漏掉它会让英文回复被硬切在半个单词中间，出现「念一半停一下再念后半句」。
+_STRONG_END = "。！？!?～~…."
 # 弱语气停顿：缓冲区过长时才退而求其次
 _WEAK_END = "，,；;、：:"
 # 需要从输出里剔除的噪声（思考标记等）
@@ -118,7 +144,10 @@ def split_sentence(buffer: str, *, max_len: int = 40) -> tuple[str | None, str]:
     返回 (完整句子 或 None, 剩余缓冲)。
 
     策略：
-      1. 优先在强语气标点（。！？）处切 —— 这是自然的语句边界
+      1. 优先在强语气标点（。！？）处切，且**切到最后一个**：
+         一次收到多句时合并成一段交给 TTS。这是刻意的取舍 ——
+         切得更碎会让 TTS 往返次数线性增长（实测单次往返约 2.4s），
+         代价是句间停顿变少。若将来改成「边收边合成」，应改为切第一个。
       2. 缓冲区超过 max_len 仍无强标点时，退而在逗号处切
          —— 避免第一句话太长导致听众等太久
       3. 都不满足则返回 None，等更多 token
@@ -130,15 +159,21 @@ def split_sentence(buffer: str, *, max_len: int = 40) -> tuple[str | None, str]:
     last_strong = max((buffer.rfind(ch) for ch in _STRONG_END), default=-1)
     if last_strong >= 0:
         sentence = buffer[: last_strong + 1].strip()
-        return sentence, buffer[last_strong + 1 :]
+        # 剩余部分 lstrip：英文句点后通常是空格，留着会让下一句带前导空白
+        return sentence, buffer[last_strong + 1 :].lstrip()
 
     if len(buffer) >= max_len:
         last_weak = max((buffer.rfind(ch, 0, max_len) for ch in _WEAK_END), default=-1)
         if last_weak >= 0:
             sentence = buffer[: last_weak + 1].strip()
-            return sentence, buffer[last_weak + 1 :]
-        # 实在找不到标点，硬切，总比无限等待好
-        return buffer[:max_len].strip(), buffer[max_len:]
+            return sentence, buffer[last_weak + 1 :].lstrip()
+        # 实在找不到标点，只能硬切 —— 但英文优先退到词边界，
+        # 否则会出现 keep|s going 这种把单词劈开的情况
+        cut = buffer[:max_len]
+        space = cut.rfind(" ")
+        if space > max_len // 2:
+            cut = cut[: space + 1]
+        return cut.strip(), buffer[len(cut) :]
 
     return None, buffer
 
@@ -150,10 +185,20 @@ def clean_for_speech(text: str) -> str:
     因为 TTS 会把「**」「#」原样念出来。
     """
     text = _NOISE.sub("", text)
-    # Markdown 强调符号
-    text = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", text)
-    # 行首的列表 / 标题符号
-    text = re.sub(r"^\s*[-•#]+\s*", "", text, flags=re.MULTILINE)
+    # Markdown 代码围栏整体去掉，否则围栏里的内容会被当成正文念出来
+    text = re.sub(r"```[\s\S]*?```", "", text)   # 成对围栏
+    text = re.sub(r"```[^\n]*", "", text)              # 落单的开围栏
+    # 链接 [文字](地址) 只保留文字
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    # 强调符号只处理「成对且被词边界包围」的，否则会篡改正文：
+    # 星号 —— a*b*c 这类表达式不该被吃掉
+    text = re.sub(r"(?<![\w*])\*{1,3}([^*\n]+?)\*{1,3}(?![\w*])", r"\1", text)
+    # 下划线 —— 必须不在词中，否则 snake_case_name 会被吃成 snakecasename。
+    # 阿源被问到「这个变量叫什么」时会念出错误的名字，
+    # 而清洗后的文本还会写进会话记忆，污染后续每一轮上下文
+    text = re.sub(r"(?<![\w_])_{1,3}([^_\n]+?)_{1,3}(?![\w_])", r"\1", text)
+    # 行首的列表 / 标题符号（含数字列表 1. / 2、 / 3)）
+    text = re.sub(r"^\s*(?:[-•#]+|\d+[.、)])\s*", "", text, flags=re.MULTILINE)
     # 表情符号与杂项符号
     text = re.sub(
         "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0001F2FF]+",
