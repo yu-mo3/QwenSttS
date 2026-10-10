@@ -94,7 +94,8 @@ def setup_logging(
         root.addHandler(file_handler)
 
     if quiet_third_party:
-        for noisy in ("urllib3", "httpx", "httpcore", "openai", "asyncio"):
+        # httpx2 是 openai>=3.x 使用的 HTTP 客户端，日志名与 httpx 不同
+        for noisy in ("urllib3", "httpx", "httpx2", "httpcore", "httpcore2", "openai", "asyncio"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

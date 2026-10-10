@@ -23,12 +23,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 BANNER_WIDTH = 62
 
-# sounddevice 在 Windows 上的默认宿主接口。同一个物理设备会在 MME /
-# DirectSound / WASAPI / WDM-KS 下各出现一次，只列 MME 才不会淹没用户。
-PREFERRED_HOSTAPI = "MME"
-
-# 蓝牙「免提」端点：一旦启用，音质掉到电话级别，路由时要主动避开
-HANDSFREE_MARKERS = ("hands-free", "免提", "bthhfenum")
+# 项目内部依赖必须放在 sys.path 调整之后
+from app.audio.devices import (  # noqa: E402
+    PREFERRED_HOSTAPI,
+    is_handsfree,
+    list_devices,
+    suggest_route,
+)
+from app.config import ENV_FILE, Config, mask_secret  # noqa: E402
+from app.core.logger import ensure_utf8_stdout  # noqa: E402
 
 # 依赖清单：(导入名, pip 包名, 用途, 是否 M1 必需)
 DEPENDENCIES = [
@@ -45,13 +48,19 @@ CheckResult = bool | None
 
 
 def _force_utf8() -> None:
-    """Windows 控制台默认 GBK，中文与制表符会乱码。"""
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+    """Windows 控制台默认 GBK，中文与制表符会乱码。
+
+    复用 app.core.logger 的实现 —— 同一段逻辑不该写两遍。
+    """
+    ensure_utf8_stdout()
+
+
+def _supports_color() -> bool:
+    """是否值得输出 ANSI 颜色。
+
+    重定向到文件时 isatty() 为 False，此时写转义序列只会污染日志。
+    """
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
 
 def banner(title: str) -> None:
@@ -83,11 +92,6 @@ def info(message: str = "") -> None:
     print(f"     {message}")
 
 
-def is_handsfree(name: str) -> bool:
-    lowered = name.lower()
-    return any(marker in lowered for marker in HANDSFREE_MARKERS)
-
-
 # ══════════════════════════════════════════════════════════
 #  第 1 步：运行环境
 # ══════════════════════════════════════════════════════════
@@ -108,10 +112,17 @@ def check_runtime() -> bool:
     info(f"解释器：{sys.executable}")
 
     missing_required: list[str] = []
+    from importlib.metadata import version as _pkg_version
+
     for module, package, purpose, required in DEPENDENCIES:
         try:
-            imported = __import__(module)
-            ver = getattr(imported, "__version__", "")
+            __import__(module)
+            # 优先问安装元数据：dotenv / pydub 这类包没有 __version__ 属性，
+            # 用 getattr 取只会得到空字符串，版本列白白空着
+            try:
+                ver = _pkg_version(package)
+            except Exception:
+                ver = getattr(sys.modules[module], "__version__", "")
             suffix = f" {ver}" if ver else ""
             ok(f"{package:<16}{suffix:<11}{purpose}")
         except Exception:
@@ -134,8 +145,6 @@ def check_runtime() -> bool:
 
 def check_config():
     step(2, 5, "配置与密钥")
-    from app.config import ENV_FILE, Config
-
     config = Config.load()
 
     if ENV_FILE.exists():
@@ -146,7 +155,7 @@ def check_config():
 
     key = config.secrets.dashscope_api_key
     if key:
-        ok(f"百炼 API Key 已配置（{key[:8]}…{key[-4:]}，共 {len(key)} 字符）")
+        ok(f"百炼 API Key 已配置（{mask_secret(key)}）")
     else:
         fail("百炼 API Key 未配置 —— M2 之后的所有云端能力都会失败")
         info("获取地址：https://bailian.console.aliyun.com/")
@@ -174,28 +183,9 @@ def check_config():
 #  第 3 步：音频设备
 # ══════════════════════════════════════════════════════════
 
-def _suggest_route(inputs, outputs):
-    """给出推荐设备路由。
-
-    Windows 上蓝牙耳机有个通病：一旦用它当麦克风，系统会把设备切到
-    「免提模式」(Hands-Free)，音质骤降到电话级别。所以推荐「内置麦克风
-    收音 + 蓝牙耳机放音」，两条链路互不干扰。
-    """
-    mic = next((d for d in inputs if "麦克风阵列" in d.name or "microphone array" in d.name.lower()), None)
-    if mic is None:
-        mic = next((d for d in inputs if not is_handsfree(d.name)), None)
-
-    headphone = next(
-        (d for d in outputs if ("耳机" in d.name or "headphone" in d.name.lower()) and not is_handsfree(d.name)),
-        None,
-    )
-    speaker = headphone or next((d for d in outputs if not is_handsfree(d.name)), None)
-    return mic, speaker
-
-
 def check_devices(config, show_all: bool = False) -> tuple[bool, bool]:
     step(3, 5, "音频设备")
-    from app.audio.devices import default_device, list_devices
+    from app.audio.devices import default_device
 
     try:
         devices = list_devices()
@@ -239,15 +229,16 @@ def check_devices(config, show_all: bool = False) -> tuple[bool, bool]:
         info("同一硬件在不同接口下会重复出现，已折叠。加 --all-devices 可查看全部。")
 
     # ---------- 推荐路由 ----------
-    mic, out = _suggest_route([d for d in devices if d.is_input], [d for d in devices if d.is_output])
+    # 路由知识来自 app/audio/devices.py —— 与 main.py --devices 共用同一实现，
+    # 将来编排层做设备自动选择时也走这里
+    route = suggest_route(devices)
     print()
     print("  💡 推荐路由")
-    if mic:
-        info(f"麦克风 → {mic.name}（index {mic.index}）")
-    if out:
-        info(f"播放   → {out.name}（index {out.index}）")
-    info("理由：蓝牙耳机一旦兼任麦克风会被系统切到「免提模式」，音质骤降；")
-    info("      让内置麦克风收音、耳机放音，两条链路各司其职。")
+    if route.input_device:
+        info(f"麦克风 → {route.input_device.name}（index {route.input_device.index}）")
+    if route.output_device:
+        info(f"播放   → {route.output_device.name}（index {route.output_device.index}）")
+    info(f"理由：{route.reason}")
     if config.audio.input_device or config.audio.output_device:
         info()
         info(f"当前 .env 已指定：输入='{config.audio.input_device}' 输出='{config.audio.output_device}'")
@@ -267,6 +258,8 @@ def _draw_meter(level: float, width: int = 34) -> str:
     scaled = min(level / 0.25, 1.0)
     filled = int(scaled * width)
     bar = "█" * filled + "░" * (width - filled)
+    if not _supports_color():
+        return bar
     if scaled > 0.75:
         color = "\033[31m"
     elif scaled > 0.35:
@@ -288,6 +281,8 @@ def record_test(config, seconds: float) -> bytes | None:
     print()
 
     target_samples = int(seconds * config.audio.sample_rate)
+    # 每帧的字节数 = 采样宽度 × 声道数，不能写死成 2（单声道假设）
+    bytes_per_sample = config.audio.sample_width * config.audio.channels
     collected = 0
     chunks: list[bytes] = []
     peak = 0.0
@@ -296,7 +291,7 @@ def record_test(config, seconds: float) -> bytes | None:
         mic.open()
         for frame in mic.frames():
             chunks.append(frame)
-            collected += len(frame) // config.audio.sample_width
+            collected += len(frame) // bytes_per_sample
 
             level = Microphone.rms(frame)
             peak = max(peak, level)
@@ -340,25 +335,38 @@ def record_test(config, seconds: float) -> bytes | None:
 # ══════════════════════════════════════════════════════════
 
 def playback_test(config, pcm: bytes | None) -> CheckResult:
-    step(5, 5, "回放测试")
-    if not pcm:
-        warn("没有可回放的录音，跳过")
-        return None
+    """验证输出链路。
 
+    没有录音时（例如机器没有麦克风）改播一声提示音 —— 回放能力与麦克风
+    无关，不该因为录音失败就一并放弃验证。
+    """
+    step(5, 5, "回放测试")
     from app.audio.player import Speaker
 
     speaker = Speaker(config.audio)
     info(f"扬声器：{speaker.device_name()}")
     print()
-    print("  🔊 正在播放刚才的录音…")
+
+    if pcm:
+        print("  🔊 正在播放刚才的录音…")
+        label = "播放录音"
+    else:
+        print("  🔔 没有录音可放，改播提示音来验证输出链路…")
+        label = "播放提示音"
+
     try:
-        speaker.play(pcm)
+        # play() 返回「是否完整播完」，不能只看「有没有抛异常」——
+        # 否则被打断或音频为空时会静默失败，而自检照样打印「播放完成」
+        completed = speaker.play(pcm) if pcm else (speaker.beep() or True)
     except Exception as exc:
-        fail(f"播放失败：{exc}")
+        fail(f"{label}失败：{exc}")
         return False
 
     print()
-    ok("播放完成")
+    if not completed:
+        warn(f"{label}被中途打断（是否误触了停止？）")
+        return False
+    ok(f"{label}完成")
     return True
 
 
@@ -393,10 +401,11 @@ def main() -> int:
     elif not has_mic:
         step(4, 5, "录音测试")
         fail("没有找到任何输入设备，无法录音")
-        step(5, 5, "回放测试")
-        info("跳过")
+        # 输出链路与麦克风无关 —— 仍然播一声提示音验证
+        playback_result = playback_test(config, None)
     else:
-        seconds = args.seconds or config.audio.record_seconds
+        # 用 is None 而不是 or：--seconds 0 是合法输入，不该被 falsy 换成默认值
+        seconds = config.audio.record_seconds if args.seconds is None else args.seconds
         recorded = record_test(config, seconds)
         playback_result = playback_test(config, recorded)
 
@@ -429,7 +438,8 @@ def main() -> int:
             print("  🎉 已检查的项目全部通过！")
             print(f"     （{len(skipped)} 项因 --no-record 跳过，去掉该参数即可完整测试）")
         else:
-            print("  🎉 M1 通过！可以进入 M2（语音识别 → 对话 → 语音合成）")
+            print("  🎉 环境自检全部通过！")
+            print("     下一步：python tools/m2_chat.py 就能跟她对话了")
     else:
         print(f"  ⚠️  {len(failures)} 项未通过，按上面的提示处理后重新运行：")
         for name in failures:

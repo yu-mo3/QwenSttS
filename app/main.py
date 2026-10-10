@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import __version__
-from app.config import Config
+from app.config import Config, mask_secret
 from app.core.logger import ensure_utf8_stdout, get_logger, setup_logging
 
 log = get_logger("ayuan")
@@ -42,20 +42,13 @@ BANNER = """
 # 里程碑状态：(编号, 名称, 状态)  状态取值 done / doing / todo
 MILESTONES = [
     ("M1", "工程骨架 · L1 基础层 · L2 设备层", "done"),
-    ("M2", "L4 能力层：语音识别 → 对话 → 语音合成", "doing"),
-    ("M3", "L3+L5：离线唤醒 · VAD 断句 · 连续对话 · 打断", "todo"),
+    ("M2", "L4 能力层：语音识别 → 对话 → 语音合成", "done"),
+    ("M3", "L3+L5：离线唤醒 · VAD 断句 · 连续对话 · 打断", "doing"),
     ("M4", "L6 表现层：PySide6 桌面界面", "todo"),
     ("M5", "视觉理解 · Agent 工具池 · 打包分发", "todo"),
 ]
 
 _STATUS_MARK = {"done": "✅", "doing": "🚧", "todo": "⏳"}
-
-
-def _mask(secret: str) -> str:
-    """密钥脱敏显示。"""
-    if not secret:
-        return "未配置"
-    return f"{secret[:8]}…{secret[-4:]}（共 {len(secret)} 字符）"
 
 
 def show_status(config: Config) -> None:
@@ -64,7 +57,7 @@ def show_status(config: Config) -> None:
 
     print("  ── 配置 ──────────────────────────────────────────")
     print(f"     版本       : {__version__}")
-    print(f"     百炼 API   : {'✅ ' + _mask(config.secrets.dashscope_api_key) if config.secrets.has_dashscope else '❌ 未配置，云端能力不可用'}")
+    print(f"     百炼 API   : {'✅ ' + mask_secret(config.secrets.dashscope_api_key) if config.secrets.has_dashscope else '❌ 未配置，云端能力不可用'}")
     print(f"     天气 API   : {'✅ 已配置' if config.secrets.has_weather else '⚠️  未配置（M5 才需要）'}")
     print(f"     对话模型   : {config.model.llm}（思考模式：{'开' if config.model.enable_thinking else '关'}）")
     print(f"     识别 / 合成: {config.model.asr} / {config.model.tts} · 音色 {config.model.tts_voice}")
@@ -79,47 +72,91 @@ def show_status(config: Config) -> None:
     print()
 
 
-def show_devices(config: Config) -> None:
-    """打印音频设备与推荐路由。"""
-    from app.audio.devices import default_device, list_devices
+def _device_line(dev, *, is_default: bool) -> str:
+    """一行设备描述，带状态标记。"""
+    marks = []
+    if is_default:
+        marks.append("系统默认")
+    if dev.is_handsfree:
+        marks.append("免提模式·音质差")
+    suffix = f"   ← {'，'.join(marks)}" if marks else ""
+    return f"        [{dev.index:>2}] {dev.name}{suffix}"
+
+
+def show_devices(config: Config, *, show_all: bool = False) -> None:
+    """打印音频设备与推荐路由。
+
+    路由知识（免提规避策略）住在 app/audio/devices.py —— 那是业务知识，
+    不是诊断脚本的私货，编排层将来也要用同一套。
+    """
+    from app.audio.devices import PREFERRED_HOSTAPI, default_device, list_devices, suggest_route
 
     print("  ── 音频设备 ──────────────────────────────────────")
     try:
-        devices = [d for d in list_devices() if d.hostapi == "MME"]
+        all_devices = list_devices()
     except Exception as exc:
         print(f"     ❌ 设备枚举失败：{exc}")
         print()
         return
 
+    shown = all_devices if show_all else [d for d in all_devices if d.hostapi == PREFERRED_HOSTAPI]
+    hidden = len(all_devices) - len(shown)
     din = default_device(want_input=True)
     dout = default_device(want_input=False)
 
     print("     🎤 输入：")
-    for dev in devices:
+    for dev in shown:
         if dev.is_input:
-            mark = "  ← 系统默认" if din and dev.index == din.index else ""
-            print(f"        [{dev.index:>2}] {dev.name}{mark}")
+            print(_device_line(dev, is_default=bool(din and dev.index == din.index)))
+
     print("     🔊 输出：")
-    for dev in devices:
+    for dev in shown:
         if dev.is_output:
-            mark = "  ← 系统默认" if dout and dev.index == dout.index else ""
-            print(f"        [{dev.index:>2}] {dev.name}{mark}")
+            print(_device_line(dev, is_default=bool(dout and dev.index == dout.index)))
+
+    if hidden > 0 and not show_all:
+        print(f"     （另有 {hidden} 个端点属于其它驱动接口，已折叠；加 --all-devices 查看全部）")
+
+    route = suggest_route(all_devices)
+    print()
+    print("     💡 推荐路由")
+    if route.input_device:
+        print(f"        麦克风 → {route.input_device.name}（index {route.input_device.index}）")
+    if route.output_device:
+        print(f"        播放   → {route.output_device.name}（index {route.output_device.index}）")
+    print(f"        理由：{route.reason}")
     print()
 
 
-def cmd_check(config: Config) -> int:
-    """运行环境自检（转发给 tools/check_env.py）。"""
+def cmd_check(config: Config, args: argparse.Namespace) -> int:
+    """运行环境自检（转发给 tools/check_env.py）。
+
+    必须把参数**透传**过去 —— 否则无麦克风的机器（CI、服务器、
+    VSCode Remote）永远跑不过自检，而 check_env 明明支持 --no-record。
+    """
     import runpy
 
     script = PROJECT_ROOT / "tools" / "check_env.py"
     if not script.exists():
         log.error("找不到自检脚本：%s", script)
         return 1
-    sys.argv = [str(script)]
+
+    forwarded = [str(script)]
+    if args.no_record:
+        forwarded.append("--no-record")
+    if args.all_devices:
+        forwarded.append("--all-devices")
+    if args.seconds is not None:
+        forwarded += ["--seconds", str(args.seconds)]
+
+    previous_argv = sys.argv
+    sys.argv = forwarded
     try:
         runpy.run_path(str(script), run_name="__main__")
     except SystemExit as exc:
         return int(exc.code or 0)
+    finally:
+        sys.argv = previous_argv
     return 0
 
 
@@ -129,14 +166,15 @@ def cmd_run(config: Config) -> int:
     show_devices(config)
 
     print("  ── 状态 ──────────────────────────────────────────")
-    print("     🚧 当前处于 M1 阶段：地基已就绪，阿源还没有「大脑」。")
+    print("     ✅ 地基与能力层已就绪：阿源已经能听、能说、能聊。")
     print()
     print("     现在可以做的：")
-    print("       · 运行环境自检    →  python -m app.main --check")
-    print("       · 查看音频设备    →  python -m app.main --devices")
+    print("       · 语音对话       →  python tools/m2_chat.py")
+    print("       · 纯文字对话     →  python tools/m2_chat.py --text")
+    print("       · 运行环境自检   →  python -m app.main --check")
+    print("       · 查看音频设备   →  python -m app.main --devices")
     print()
-    print("     下一步 M2 将接入：语音识别 → 对话 → 语音合成。")
-    print("     届时直接运行 python -m app.main 就能和她对话。")
+    print("     M3 将接入：离线唤醒词「阿源」· VAD 自动断句 · 随时打断。")
     print()
     print("  ──────────────────────────────────────────────────")
     return 0
@@ -157,6 +195,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"阿源 QwenSttS {__version__}")
     parser.add_argument("--check", action="store_true", help="先运行环境自检，再退出")
     parser.add_argument("--devices", action="store_true", help="只打印音频设备与推荐路由")
+    parser.add_argument("--no-record", action="store_true", dest="no_record", help="自检时跳过录音与回放（无麦克风环境）")
+    parser.add_argument("--all-devices", action="store_true", dest="all_devices", help="显示全部驱动接口下的设备端点")
+    parser.add_argument("--seconds", type=float, default=None, help="自检录音时长（秒）")
     parser.add_argument("--verbose", "-v", action="store_true", help="输出调试日志")
     return parser
 
@@ -172,10 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     config.ensure_dirs()
 
     if args.check:
-        return cmd_check(config)
+        return cmd_check(config, args)
 
     if args.devices:
-        show_devices(config)
+        show_devices(config, show_all=args.all_devices)
         return 0
 
     return cmd_run(config)

@@ -14,7 +14,9 @@ pydub>=0.25.1               # 音频格式转换（依赖系统 ffmpeg）
 
 # ---- L4 能力层（云端调用）----
 requests>=2.32.3            # 百炼原生端点 / 天气 API
-openai>=1.54.0              # 百炼 OpenAI 兼容端点（LLM / VLM）
+# 实测在 3.28.0 上跑通（依赖 httpx2，注意与 httpx 的日志名不同），
+# 加下界以免未来大版本改动流式 chunk 结构
+openai>=3.28,<4            # 百炼 OpenAI 兼容端点（LLM / VLM）
 
 # ---- L3 感知层（M3 里程碑启用，提前锁定版本）----
 # sherpa-onnx>=1.13.8       # 关键词唤醒（KWS）
