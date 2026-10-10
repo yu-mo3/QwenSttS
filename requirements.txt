@@ -1,0 +1,27 @@
+# QwenSttS 依赖清单
+# 安装：.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Python 版本要求：3.11 ~ 3.12
+#   ⚠️ 不要用 3.13+：vosk / webrtcvad / pyaudio 等尚无对应 wheel
+
+# ---- L1 基础层 ----
+python-dotenv>=1.0.1        # .env 配置加载
+
+# ---- L2 音频设备层 ----
+sounddevice>=0.5.1          # 麦克风采集 / 扬声器播放（PortAudio 绑定，低延迟可中断）
+numpy>=1.26.4               # PCM 帧运算、能量计算
+pydub>=0.25.1               # 音频格式转换（依赖系统 ffmpeg）
+
+# ---- L4 能力层（云端调用）----
+requests>=2.32.3            # 百炼原生端点 / 天气 API
+openai>=1.54.0              # 百炼 OpenAI 兼容端点（LLM / VLM）
+
+# ---- L3 感知层（M3 里程碑启用，提前锁定版本）----
+# sherpa-onnx>=1.13.8       # 关键词唤醒（KWS）
+# webrtcvad-wheels>=2.0.14  # 语音活动检测（注意：包名带 -wheels，导入名仍是 webrtcvad）
+
+# ---- L6 表现层（M4 里程碑启用）----
+# PySide6>=6.8.0
+
+# ---- 视觉（M5 里程碑启用）----
+# opencv-python>=4.10.0

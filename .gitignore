@@ -1,0 +1,61 @@
+# ============================================================
+#  QwenSttS · .gitignore
+#  ⚠️ 本文件必须在「第一次 commit 之前」就位。
+#     密钥一旦进入 git 历史，即使后续删除也永远可被翻出。
+# ============================================================
+
+# ---------- 🔐 密钥与本地配置（绝不入库）----------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# ---------- 📕 参考资料（含第三方版权 + 探测脚本明文密钥）----------
+_ref/
+*.pdf
+
+# ---------- 🐍 Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- 🎛️ 模型文件（体积大，运行时单独下载）----------
+models/*
+!models/.gitkeep
+!models/README.md
+
+# ---------- 💾 运行产物 ----------
+data/
+temp/
+logs/
+*.log
+recordings/
+cache/
+
+# ---------- 🛠️ IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- 🪟 Windows ----------
+desktop.ini
