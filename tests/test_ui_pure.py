@@ -17,6 +17,8 @@ QApplication 建一遍窗口，成本不到一秒，能拦住上面全部三类�
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 # ⚠️ import 顺序要紧：app.ui 必须在 PySide6.QtCore 之前被 import ——
@@ -44,6 +46,14 @@ from app.ui import theme  # noqa: E402
 from app.ui.bridge import SUBSCRIBED_EVENTS, EventBridge  # noqa: E402
 from app.ui.controller import SessionController  # noqa: E402
 from app.ui import orb  # noqa: E402
+from app.ui.history import (  # noqa: E402
+    ROLE_ASSISTANT,
+    ROLE_USER,
+    HistoryModel,
+    HistoryPanel,
+    describe_first_byte,
+    format_clock,
+)
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
 
@@ -239,19 +249,19 @@ class TestMainWindowSmoke:
         window.bridge.feed_event(
             EVT_LLM_DONE, {"text": "你也好。", "sentences": ["你也好。"], "first_byte": 0.3}
         )
-        text = window.history.toPlainText()
+        text = window.history.to_plain_text()
         assert "你好" in text and "你也好。" in text
 
     def test_typed_input_is_labelled_in_the_history(self, window):
         window.bridge.feed_event(
             EVT_ASR_DONE, {"text": "打字内容", "emotion": "", "elapsed": 0.0, "source": "typed"}
         )
-        assert "打字" in window.history.toPlainText()
+        assert "打字" in window.history.to_plain_text()
 
     def test_errors_are_visible_in_the_history(self, window):
         """静默失败是这个项目反复踩的坑 —— 出错必须在界面上看得见。"""
         window.bridge.feed_event(EVT_ERROR, {"message": "云端挂了", "hint": "稍后再试"})
-        text = window.history.toPlainText()
+        text = window.history.to_plain_text()
         assert "云端挂了" in text and "稍后再试" in text
 
     def test_level_meter_reacts(self, window):
@@ -482,4 +492,223 @@ class TestOrbFitsInsideItsWidget:
         base = half * orb.MAX_RADIUS_RATIO
         frame = orb.orb_frame(AssistantState.IDLE, t=0.0, base_radius=base)
         assert frame.radius / half > 0.4, f"球体太小了：{frame.radius / half:.2f}"
+
+# ══════════════════════════════════════════════════════
+#  纯逻辑：对话历史的模型
+# ══════════════════════════════════════════════════════
+
+class TestHistoryModel:
+    def test_records_both_sides(self):
+        model = HistoryModel()
+        model.add_user("你好")
+        model.add_assistant("你也好。")
+        assert [e.role for e in model.entries] == [ROLE_USER, ROLE_ASSISTANT]
+        assert model.entries[0].text == "你好"
+
+    def test_user_label_distinguishes_typed_from_spoken(self):
+        """打字必须标注出来，否则排障时会去怀疑麦克风。"""
+        model = HistoryModel()
+        assert model.add_user("说话").label == "你"
+        assert model.add_user("打字", source="typed").label == "你 · 打字"
+
+    def test_assistant_label_is_the_app_name(self):
+        assert HistoryModel().add_assistant("在").label == "阿源"
+
+    def test_unknown_source_falls_back_to_speech(self):
+        model = HistoryModel()
+        assert model.add_user("x", source="天知道").label == "你"
+
+    def test_notes_have_no_speaker(self):
+        assert HistoryModel().add_note("被打断").label == ""
+
+    def test_limit_drops_the_oldest(self):
+        """常驻一整天的助手不该把内存吃光。"""
+        model = HistoryModel(limit=3)
+        for index in range(5):
+            model.add_user(f"第{index}句")
+        assert len(model) == 3
+        assert [e.text for e in model.entries] == ["第2句", "第3句", "第4句"]
+
+    def test_limit_is_at_least_one(self):
+        model = HistoryModel(limit=0)
+        model.add_user("x")
+        assert len(model) == 1
+
+    def test_clear(self):
+        model = HistoryModel()
+        model.add_user("x")
+        model.clear()
+        assert model.entries == ()
+
+    def test_entries_is_a_snapshot(self):
+        """返回元组而不是内部列表：调用方改不动模型内部状态。"""
+        model = HistoryModel()
+        model.add_user("x")
+        assert isinstance(model.entries, tuple)
+
+    def test_clock_is_rendered(self):
+        entry = HistoryModel().add_user("x", now=0.0)
+        assert len(entry.clock) == 5 and entry.clock[2] == ":"
+
+
+class TestHistoryFormatting:
+    def test_first_byte_reads_as_a_sentence(self):
+        assert describe_first_byte(0.46) == "首字 0.46s"
+
+    def test_missing_first_byte_shows_nothing(self):
+        """显示 0.00s 会被读成「快得不可思议」，而真相是「没测到」。"""
+        assert describe_first_byte(None) == ""
+        assert describe_first_byte(0.0) == ""
+        assert describe_first_byte(-1.0) == ""
+
+    def test_bool_is_not_a_number(self):
+        """True 是 int 的子类 —— 掉进去会显示出「首字 1.00s」这种鬼东西。"""
+        assert describe_first_byte(True) == ""
+        assert describe_first_byte(False) == ""
+
+    def test_garbage_is_ignored(self):
+        assert describe_first_byte("很快") == ""
+
+    def test_clock_format(self):
+        assert len(format_clock(time.time())) == 5
+
+
+# ══════════════════════════════════════════════════════
+#  控件：历史面板
+# ══════════════════════════════════════════════════════
+
+class TestHistoryPanel:
+    def test_starts_with_a_placeholder(self, qapp):
+        panel = HistoryPanel()
+        assert panel.model.entries == ()
+        assert panel._placeholder.isVisible() is False  # 未显示，但存在于布局里
+
+    def test_adding_hides_the_placeholder(self, qapp):
+        panel = HistoryPanel()
+        panel.show()
+        panel.add_user("你好")
+        assert panel._placeholder.isVisible() is False
+
+    def test_plain_text_contains_both_sides(self, qapp):
+        panel = HistoryPanel()
+        panel.add_user("你好")
+        panel.add_assistant("你也好。", 0.46)
+        text = panel.to_plain_text()
+        assert "你：你好" in text
+        assert "阿源：你也好。" in text
+        assert "首字 0.46s" in text
+
+    def test_typed_entries_are_labelled(self, qapp):
+        panel = HistoryPanel()
+        panel.add_user("打字内容", "typed")
+        assert "你 · 打字" in panel.to_plain_text()
+
+    def test_notes_appear_in_the_text(self, qapp):
+        panel = HistoryPanel()
+        panel.add_note("被打断")
+        assert "被打断" in panel.to_plain_text()
+
+    def test_bubbles_are_trimmed_with_the_model(self, qapp):
+        """模型丢了最旧的，控件也得跟着丢 —— 否则内存只涨不降。"""
+        panel = HistoryPanel(limit=3)
+        for index in range(6):
+            panel.add_user(f"第{index}句")
+        assert len(panel._bubbles) == 3
+        assert len(panel.model) == 3
+
+    def test_clear_removes_every_bubble(self, qapp):
+        panel = HistoryPanel()
+        panel.add_user("a")
+        panel.add_assistant("b")
+        panel.clear()
+        assert panel._bubbles == []
+        assert panel.to_plain_text() == ""
+
+    def test_bubble_width_follows_the_panel(self, qapp):
+        """拉宽窗口时气泡要跟着变宽，否则长回复会被挤成窄窄一条。"""
+        panel = HistoryPanel()
+        panel.resize(600, 400)
+        panel.add_user("x")
+        narrow = panel._bubbles[0][1].maximumWidth()
+
+        panel.resize(900, 400)
+        panel._apply_bubble_width()   # 不依赖事件循环，直接触发重算
+        wide = panel._bubbles[0][1].maximumWidth()
+
+        assert wide > narrow, f"面板变宽了气泡却没变：{narrow} -> {wide}"
+
+
+# ══════════════════════════════════════════════════════
+#  输入行
+# ══════════════════════════════════════════════════════
+
+class _StubController:
+    """只记录收到的指令，不真的开会话。"""
+
+    def __init__(self, bridge):
+        self.bridge = bridge
+        self.is_running = True
+        self.submitted: list[str] = []
+        self.posted: list[str] = []
+
+    def submit_text(self, text: str) -> bool:
+        self.submitted.append(text)
+        return True
+
+    def post(self, command: str) -> None:
+        self.posted.append(command)
+
+    def start(self) -> bool:
+        return True
+
+    def stop(self) -> None:
+        pass
+
+    def stop_speaking(self) -> None:
+        pass
+
+    def listen_now(self) -> None:
+        pass
+
+
+class TestInputRow:
+    def test_send_is_disabled_while_empty(self, window):
+        assert window.send_button.isEnabled() is False
+        window.input.setText("你好")
+        assert window.send_button.isEnabled() is True
+        window.input.setText("   ")
+        assert window.send_button.isEnabled() is False, "全是空格也不算有内容"
+
+    def test_sending_clears_the_input(self, window):
+        window.controller = _StubController(window.bridge)
+        window.input.setText("你好")
+        window.on_send_clicked()
+        assert window.input.text() == ""
+
+    def test_sending_does_not_double_up_the_bubble(self, window):
+        """M4-5 修的 bug。
+
+        on_send_clicked 自己往历史里加一条，编排层的 asr_done 又加一条 ——
+        结果是两个一模一样的用户气泡。打字输入本来就该由事件流驱动，
+        界面自己再写一遍就是重复记账。
+        """
+        stub = _StubController(window.bridge)
+        window.controller = stub
+        window.input.setText("你好")
+        window.on_send_clicked()
+        assert stub.submitted == ["你好"]
+
+        window.bridge.feed_event(
+            EVT_ASR_DONE,
+            {"text": "你好", "emotion": "", "elapsed": 0.0, "source": "typed"},
+        )
+        text = window.history.to_plain_text()
+        assert text.count("你好") == 1, f"用户气泡重复了：{text}"
+
+    def test_empty_input_does_nothing(self, window):
+        stub = _StubController(window.bridge)
+        window.controller = stub
+        window.input.setText("   ")
+        window.on_send_clicked()
+        assert stub.submitted == []
 

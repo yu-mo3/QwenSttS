@@ -46,6 +46,7 @@ from app.orchestrator.states import AssistantState
 from app.ui import theme
 from app.ui.bridge import SOURCE_MIC, gui_thread
 from app.ui.controller import SessionController
+from app.ui.history import HistoryPanel
 from app.ui.orb import OrbWidget
 
 log = get_logger(__name__)
@@ -160,9 +161,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("Title")
         layout.addWidget(title)
 
-        self.history = QPlainTextEdit()
-        self.history.setReadOnly(True)
-        self.history.setPlaceholderText("还没有对话。喊一声「阿源」或直接打字。")
+        self.history = HistoryPanel()
         layout.addWidget(self.history, 1)
         return panel
 
@@ -185,9 +184,11 @@ class MainWindow(QMainWindow):
         self.input = QLineEdit()
         self.input.setPlaceholderText("打字和阿源说话，回车发送…")
         self.input.setClearButtonEnabled(True)
+        self.input.textChanged.connect(self.on_input_changed)
         layout.addWidget(self.input, 1)
 
         self.send_button = QPushButton("发送")
+        self.send_button.setEnabled(False)   # 空输入时发送没有意义
         layout.addWidget(self.send_button)
 
         self.settings_button = QPushButton("⚙ 设置")
@@ -285,13 +286,11 @@ class MainWindow(QMainWindow):
 
     @gui_thread
     def on_user_said(self, text: str, source: str) -> None:
-        who = "你（打字）" if source == "typed" else "你"
-        self._append_history(f"{who}：{text}")
+        self.history.add_user(text, source)
 
     @gui_thread
     def on_reply_ready(self, text: str, sentences: list, first_byte: object) -> None:
-        timing = f"（首字 {first_byte:.2f}s）" if isinstance(first_byte, float) else ""
-        self._append_history(f"阿源{timing}：{text}")
+        self.history.add_assistant(text, first_byte)
 
     @gui_thread
     def on_speech_progress(self, index: int, total: int, duration: float) -> None:
@@ -299,27 +298,28 @@ class MainWindow(QMainWindow):
 
     @gui_thread
     def on_interrupted(self) -> None:
-        self._append_history("（被打断）")
+        self.history.add_note("被打断")
 
     @gui_thread
     def on_retrying(self, attempt: int, total: int, reason: str) -> None:
-        self._append_history(f"（云端没响应，重试 {attempt}/{total}）")
+        self.history.add_note(f"云端没响应，重试 {attempt}/{total}")
 
     @gui_thread
     def on_idle_timeout(self, seconds: float) -> None:
-        self._append_history(f"（静默 {seconds:.0f} 秒，回到待机）")
+        self.history.add_note(f"静默 {seconds:.0f} 秒，回到待机")
 
     @gui_thread
     def on_failed(self, message: str, hint: str) -> None:
-        self._append_history(f"❌ {message}")
+        # 错误必须落到历史里，不能只写日志 —— 界面上看不见就等于没发生
+        self.history.add_note(f"❌ {message}")
         if hint:
-            self._append_history(f"   {hint}")
+            self.history.add_note(hint)
         log.error("会话出错：%s（%s）", message, hint)
 
     @gui_thread
     def on_session_finished(self, stats: str) -> None:
         if stats:
-            self._append_history(f"（会话结束：{stats}）")
+            self.history.add_note(f"会话结束：{stats}")
 
     @gui_thread
     def on_session_stopped(self) -> None:
@@ -334,9 +334,6 @@ class MainWindow(QMainWindow):
         """
         summary = ", ".join(f"{k}={v!r}" for k, v in payload.items())
         self.event_log.appendPlainText(f"{event:<16} {summary}")
-
-    def _append_history(self, line: str) -> None:
-        self.history.appendPlainText(line)
 
     # ══════════════════════════════════════════════════════
     #  按钮
@@ -360,9 +357,19 @@ class MainWindow(QMainWindow):
             return
         if not self.controller.is_running:
             self.controller.start()
-        if self.controller.submit_text(text):
-            self.input.clear()
-            self._append_history(f"你（打字）：{text}")
+
+        if not self.controller.submit_text(text):
+            self.history.add_note("没送出去：会话还没就绪，稍等一下再试")
+            return
+
+        self.input.clear()
+        # 这里**不能**自己往历史里加一条 —— 打字输入会走完整的一轮，
+        # 编排层随后会发 asr_done(source=typed)，on_user_said 再渲染一次。
+        # 两边都写就会出现两个一模一样的用户气泡（M4-5 修）。
+
+    @gui_thread
+    def on_input_changed(self, text: str) -> None:
+        self.send_button.setEnabled(bool(text.strip()))
 
     @gui_thread
     def on_tech_toggled(self, shown: bool) -> None:

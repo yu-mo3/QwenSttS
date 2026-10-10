@@ -214,6 +214,19 @@ QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
     border-color: {palette.accent};
 }}
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; }}
+/* 标签一律透明：否则它们会各自带上窗口底色，把气泡和面板的底色切成一块块 */
+QLabel {{ background: transparent; }}
+QFrame#BubbleUser {{
+    background: {palette.panel_alt};
+    border: 1px solid {palette.accent};
+    border-radius: {RADIUS}px;
+}}
+QFrame#BubbleAssistant {{
+    background: {palette.panel_alt};
+    border: 1px solid {palette.border};
+    border-radius: {RADIUS}px;
+}}
+QFrame#BubbleNote {{ background: transparent; border: none; }}
 QScrollBar:vertical {{
     background: transparent; width: 10px; margin: 0;
 }}
