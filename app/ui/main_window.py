@@ -46,12 +46,22 @@ from app.orchestrator.states import AssistantState
 from app.ui import theme
 from app.ui.bridge import SOURCE_MIC, gui_thread
 from app.ui.controller import SessionController
+from app.ui.orb import OrbWidget
 
 log = get_logger(__name__)
 
 #: 事件日志最多保留多少行。排障看最近几百条足够，
 #: 无限增长会让一个常驻一整天的助手把内存吃光。
 EVENT_LOG_LIMIT = 500
+
+#: 电平条的格子数。20 格在 380px 的栏宽里刚好够看清又不占地方。
+_BAR_CELLS = 20
+
+
+def _bar(level: float) -> str:
+    """把 0~1 的电平画成一行方块。纯函数，方便测。"""
+    filled = int(round(min(max(level, 0.0), 1.0) * _BAR_CELLS))
+    return "█" * filled + "·" * (_BAR_CELLS - filled)
 
 
 class MainWindow(QMainWindow):
@@ -116,12 +126,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(theme.PAD, theme.PAD, theme.PAD, theme.PAD)
         layout.setSpacing(theme.GAP)
 
-        # 光球的位置先留出来 —— M4-4 会用真正的自绘控件替换它。
-        # 现在放一个同样尺寸的占位，保证本步就能看出整体版式。
-        self.orb = QLabel("阿源")
-        self.orb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.orb.setFixedSize(theme.ORB_DIAMETER, theme.ORB_DIAMETER)
-        self.orb.setObjectName("OrbPlaceholder")
+        self.orb = OrbWidget()
         layout.addWidget(self.orb, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.state_label = QLabel()
@@ -251,6 +256,9 @@ class MainWindow(QMainWindow):
         self.state_label.setStyleSheet("color: " + style.core + ";")
         self.hint_label.setText(style.hint)
         self.stop_button.setEnabled(state is AssistantState.SPEAKING)
+        self.orb.set_state(state)
+        # 状态换了，驱动的电平来源也跟着换：聆听看麦克风、说话看播放
+        self._push_orb_level()
 
     @gui_thread
     def on_level_changed(self, level: float, source: str) -> None:
@@ -258,11 +266,22 @@ class MainWindow(QMainWindow):
             self._mic_level = level
         else:
             self._speaker_level = level
-        # 用文字化的电平条先把「有反应」这件事做出来；
-        # M4-4 的光球会把它变成真正的涟漪，M4-6 会画出滚动波形。
-        filled = int(round(min(max(level, 0.0), 1.0) * 20))
-        bar = "█" * filled + "·" * (20 - filled)
-        self.level_label.setText(f"🎤 {bar}")
+        self._push_orb_level()
+        self.level_label.setText(
+            f"🎤 {_bar(self._mic_level)}   🔊 {_bar(self._speaker_level)}"
+        )
+
+    def _push_orb_level(self) -> None:
+        """把**当前状态对应的那一路**电平喂给光球。
+
+        聆听态要让球跟着用户的声音胀缩（他在说，球在回应他），
+        说话态要跟着播放音量脉动（她真的在出声）。
+        拿错来源的话，球会对着一个与当下无关的信号乱动。
+        """
+        if self._state is AssistantState.SPEAKING:
+            self.orb.set_level(self._speaker_level)
+        else:
+            self.orb.set_level(self._mic_level)
 
     @gui_thread
     def on_user_said(self, text: str, source: str) -> None:

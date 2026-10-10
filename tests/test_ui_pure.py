@@ -43,6 +43,7 @@ from app.orchestrator.states import AssistantState  # noqa: E402
 from app.ui import theme  # noqa: E402
 from app.ui.bridge import SUBSCRIBED_EVENTS, EventBridge  # noqa: E402
 from app.ui.controller import SessionController  # noqa: E402
+from app.ui import orb  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
 
@@ -273,3 +274,212 @@ class TestMainWindowSmoke:
     def test_tech_panel_toggles(self, window):
         window._tech_toggle.setChecked(True)
         assert window._tech_toggle.text().startswith("▾")
+
+# ══════════════════════════════════════════════════════
+#  纯逻辑：颜色插值
+# ══════════════════════════════════════════════════════
+
+class TestMixHex:
+    def test_ends_are_exact(self):
+        assert theme.mix_hex("#000000", "#FFFFFF", 0.0) == "#000000"
+        assert theme.mix_hex("#000000", "#FFFFFF", 1.0) == "#FFFFFF"
+
+    def test_midpoint(self):
+        assert theme.mix_hex("#000000", "#FFFFFF", 0.5) == "#808080"
+
+    def test_t_is_clamped(self):
+        assert theme.mix_hex("#000000", "#FFFFFF", -5.0) == "#000000"
+        assert theme.mix_hex("#000000", "#FFFFFF", 5.0) == "#FFFFFF"
+
+    def test_accepts_lowercase_input(self):
+        assert theme.mix_hex("#abcdef", "#abcdef", 0.5).upper() == "#ABCDEF"
+
+    def test_garbage_returns_the_first_colour(self):
+        """这是每 33ms 调一次的绘制路径 —— 为一个手写错的颜色串崩掉界面不值得。"""
+        assert theme.mix_hex("不是颜色", "#FFFFFF", 0.5) == "不是颜色"
+        assert theme.mix_hex("#FFF", "#FFFFFF", 0.5) == "#FFF"
+
+
+# ══════════════════════════════════════════════════════
+#  纯逻辑：光球的曲线与几何
+# ══════════════════════════════════════════════════════
+
+class TestOrbCurves:
+    def test_breath_is_a_full_period(self):
+        """峰值在 1/4 周期、谷值在 3/4 周期 —— 正弦的固有形状，不是随手定的一半。"""
+        period = orb.BREATH_PERIOD
+        assert orb.breath(0.0) == pytest.approx(0.5)
+        assert orb.breath(period / 4) == pytest.approx(1.0)
+        assert orb.breath(period / 2) == pytest.approx(0.5)
+        assert orb.breath(period * 3 / 4) == pytest.approx(0.0)
+        assert orb.breath(period) == pytest.approx(0.5)
+
+    def test_breath_stays_in_range(self):
+        for step in range(200):
+            value = orb.breath(step * 0.05)
+            assert 0.0 <= value <= 1.0
+
+    def test_pulse_stays_in_range(self):
+        for step in range(200):
+            value = orb.pulse(step * 0.01)
+            assert 0.0 <= value <= 1.0
+
+    def test_ripple_phase_wraps(self):
+        assert orb.ripple_phase(0.0) == pytest.approx(0.0)
+        assert orb.ripple_phase(orb.RIPPLE_PERIOD / 2) == pytest.approx(0.5)
+        assert orb.ripple_phase(orb.RIPPLE_PERIOD) == pytest.approx(0.0, abs=1e-9)
+
+    def test_ripple_survives_a_zero_period(self):
+        """除零会让绘制路径每帧崩一次，而它只在参数被改错时才出现。"""
+        assert orb.ripple_phase(1.0, period=0.0) == 0.0
+
+    def test_ease_reaches_the_target(self):
+        assert orb.ease(0.0, 10.0, 1.0) == pytest.approx(10.0)
+
+    def test_ease_with_zero_factor_does_nothing(self):
+        assert orb.ease(3.0, 10.0, 0.0) == pytest.approx(3.0)
+
+    def test_ease_is_monotonic_and_never_overshoots(self):
+        value = 0.0
+        for _ in range(50):
+            value = orb.ease(value, 10.0, 0.25)
+            assert 0.0 <= value <= 10.0
+
+    def test_ease_clamps_silly_factors(self):
+        assert orb.ease(0.0, 10.0, 5.0) == pytest.approx(10.0)
+        assert orb.ease(0.0, 10.0, -5.0) == pytest.approx(0.0)
+
+
+class TestOrbFrame:
+    def test_every_state_produces_a_frame(self):
+        for state in AssistantState:
+            frame = orb.orb_frame(state, t=0.3)
+            assert frame.radius > 0
+            assert frame.glow_radius >= frame.radius, "光晕必须比球体大"
+
+    def test_colours_come_from_the_state_style(self):
+        frame = orb.orb_frame(AssistantState.LISTENING, t=0.0)
+        assert frame.core == theme.style_for(AssistantState.LISTENING).core
+
+    def test_same_inputs_give_same_frame(self):
+        """纯函数：控件靠这一点才能每帧重算而不需要缓存。"""
+        first = orb.orb_frame(AssistantState.SPEAKING, level=0.4, t=1.23)
+        second = orb.orb_frame(AssistantState.SPEAKING, level=0.4, t=1.23)
+        assert first == second
+
+    def test_idle_breathes(self):
+        period = orb.BREATH_PERIOD
+        low = orb.orb_frame(AssistantState.IDLE, t=period * 3 / 4).radius
+        high = orb.orb_frame(AssistantState.IDLE, t=period / 4).radius
+        assert high > low, "待机必须有可见的呼吸，否则看起来像卡死"
+        assert high - low > 1.0, f"呼吸幅度太小会看不出来：{high - low:.2f}px"
+
+    def test_listening_follows_the_microphone_level(self):
+        quiet = orb.orb_frame(AssistantState.LISTENING, level=0.0, t=0.0).radius
+        loud = orb.orb_frame(AssistantState.LISTENING, level=1.0, t=0.0).radius
+        assert loud > quiet, "聆听时球要跟着用户音量胀缩"
+
+    def test_listening_level_is_monotonic(self):
+        radii = [
+            orb.orb_frame(AssistantState.LISTENING, level=x / 10, t=0.0).radius
+            for x in range(11)
+        ]
+        assert radii == sorted(radii)
+
+    def test_speaking_pulses(self):
+        samples = [
+            orb.orb_frame(AssistantState.SPEAKING, level=0.8, t=t / 50).radius
+            for t in range(50)
+        ]
+        assert max(samples) > min(samples), "说话态必须有脉动"
+
+    def test_thinking_rotates_without_pulsing(self):
+        first = orb.orb_frame(AssistantState.THINKING, level=0.0, t=0.0)
+        later = orb.orb_frame(AssistantState.THINKING, level=0.0, t=0.5)
+        assert first.arc_start != later.arc_start, "思考态必须转起来"
+        assert later.radius == pytest.approx(first.radius, abs=0.5), (
+            "思考态不该跟着呼吸起伏 —— 那是待机的语言"
+        )
+
+    def test_level_is_clamped(self):
+        over = orb.orb_frame(AssistantState.LISTENING, level=9.0, t=0.0)
+        at_one = orb.orb_frame(AssistantState.LISTENING, level=1.0, t=0.0)
+        under = orb.orb_frame(AssistantState.LISTENING, level=-9.0, t=0.0)
+        at_zero = orb.orb_frame(AssistantState.LISTENING, level=0.0, t=0.0)
+        assert over.radius == pytest.approx(at_one.radius)
+        assert under.radius == pytest.approx(at_zero.radius)
+
+    def test_unknown_state_falls_back(self):
+        """GEOMETRY 表里没有的状态不该抛 —— 界面永远不该因为配色表缺项而崩。"""
+        frame = orb.orb_frame("天知道", t=0.0)  # type: ignore[arg-type]
+        assert frame.radius > 0
+
+
+class TestOrbWidget:
+    def test_starts_idle(self, qapp):
+        widget = orb.OrbWidget()
+        assert widget.state is AssistantState.IDLE
+
+    def test_level_is_clamped_on_the_way_in(self, qapp):
+        widget = orb.OrbWidget()
+        widget.set_level(9.0)
+        assert widget._level == 1.0
+        widget.set_level(-9.0)
+        assert widget._level == 0.0
+
+    def test_advance_moves_towards_the_target(self, qapp):
+        widget = orb.OrbWidget()
+        widget.set_state(AssistantState.LISTENING)
+        widget.set_level(1.0)
+        before = widget._shown_radius
+        widget._advance()
+        assert widget._shown_radius >= before, "缓动方向应当朝目标，而不是反向"
+
+    def test_colours_ease_rather_than_jump(self, qapp):
+        """状态切换时颜色要渐变 —— 直接跳过去会让四态看起来像四个不同的控件。"""
+        widget = orb.OrbWidget()
+        start = widget._shown_core
+        widget.set_state(AssistantState.SPEAKING)
+        widget._advance()
+        assert widget._shown_core != start, "颜色应当已经开始过渡"
+        assert widget._shown_core != theme.style_for(AssistantState.SPEAKING).core, (
+            "一帧之内不该直接跳到目标色"
+        )
+
+
+class TestOrbFitsInsideItsWidget:
+    """光晕与涟漪必须画得下。
+
+    早期版本直接拿 width()/2 当球体半径，光晕最远画到半径的 1.87 倍 ——
+    全都溢出控件被裁掉，渲染出来是球体四周一圈**方形暗边**。
+    这个缺陷肉眼很难在代码里看出来，是把四态渲染成 PNG 才发现的。
+    """
+
+    def test_extent_ratio_is_derived_not_guessed(self):
+        assert orb.MAX_EXTENT_RATIO > 1.0, "光晕总得比球体大"
+        assert orb.MAX_RADIUS_RATIO == pytest.approx(1.0 / orb.MAX_EXTENT_RATIO)
+
+    def test_nothing_is_clipped_at_any_state_or_level(self):
+        half = theme.ORB_DIAMETER / 2.0
+        base = half * orb.MAX_RADIUS_RATIO
+        worst = 0.0
+        for state in AssistantState:
+            for level in (0.0, 0.25, 0.5, 0.75, 1.0):
+                for t in (x * 0.2 for x in range(20)):
+                    frame = orb.orb_frame(state, level=level, t=t, base_radius=base)
+                    extent = max(
+                        frame.glow_radius,
+                        frame.radius * (1.0 + orb.RIPPLE_REACH),
+                    )
+                    worst = max(worst, extent)
+        assert worst <= half + 0.5, (
+            f"有元素画到了控件外面：最远 {worst:.1f}px > 半宽 {half:.1f}px"
+        )
+
+    def test_the_sphere_is_still_prominent(self):
+        """不能为了不越界就把球画得看不见。"""
+        half = theme.ORB_DIAMETER / 2.0
+        base = half * orb.MAX_RADIUS_RATIO
+        frame = orb.orb_frame(AssistantState.IDLE, t=0.0, base_radius=base)
+        assert frame.radius / half > 0.4, f"球体太小了：{frame.radius / half:.2f}"
+

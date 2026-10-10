@@ -123,6 +123,36 @@ STATE_STYLES: dict[AssistantState, StateStyle] = {
 }
 
 
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"不是 #RRGGBB 颜色：{value!r}")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def mix_hex(first: str, second: str, t: float) -> str:
+    """两个 #RRGGBB 之间线性插值。t=0 取 first，t=1 取 second。
+
+    放在 theme 而不是 orb：它是**配色运算**，不需要 Qt。
+    QColor 的插值还牵扯整数舍入与 alpha 语义，而这里只要 RGB ——
+    纯整数运算更容易写对，也更容易测。
+
+    非法输入返回 first 而不是抛异常：这是每 33ms 调一次的绘制路径，
+    为一个人手写错的颜色串让界面崩掉不值得。
+    """
+    t = min(max(t, 0.0), 1.0)
+    try:
+        ar, ag, ab = _hex_to_rgb(first)
+        br, bg, bb = _hex_to_rgb(second)
+    except ValueError:
+        return first
+    return "#%02X%02X%02X" % (
+        round(ar + (br - ar) * t),
+        round(ag + (bg - ag) * t),
+        round(ab + (bb - ab) * t),
+    )
+
+
 def style_for(state: AssistantState | str) -> StateStyle:
     """按状态取配色。未知状态回落到待机，而不是抛异常。
 
