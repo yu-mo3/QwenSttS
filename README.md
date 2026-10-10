@@ -77,6 +77,40 @@ DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
 
 **听到自己刚才说的话 = 环境就绪。**
 
+## 💻 开发
+
+### 在 VSCode 中启动（推荐）
+
+用 VSCode 打开项目文件夹，按 **F5** 就能跑。项目已内置 4 个调试配置（`.vscode/launch.json`）：
+
+| 调试配置 | 作用 |
+|---|---|
+| ▶ **启动阿源** | 运行 `app/main.py` —— 平时就用这个 |
+| 🔍 **环境自检** | 运行五步自检（含录音回放） |
+| 🔇 **环境自检（跳过录音）** | 没麦克风时用 |
+| 🎧 **只看音频设备** | 列出设备与推荐路由 |
+
+VSCode 首次打开会提示安装推荐扩展（Python / Pylance / debugpy），点安装即可；解释器已自动指向 `.venv`。
+
+### 命令行方式
+
+```bash
+python -m app.main              # 启动阿源
+python -m app.main --check      # 环境自检
+python -m app.main --devices    # 只看音频设备
+python -m app.main -v           # 打开调试日志
+```
+
+### 三种入口的分工
+
+| 入口 | 给谁用 |
+|---|---|
+| `app/main.py` | **开发者日常**（VSCode F5 / 命令行） |
+| `run.bat` | 不想开 IDE，双击即用；将来打包给别人也是它 |
+| `tools/check_env.py` | 独立的诊断工具，专门排查环境问题 |
+
+> 💡 运行 `python -m app.main` 会打印当前配置摘要、里程碑进度和音频设备，是一个"项目体检面板"，M2 起这里会接入语音对话主循环。
+
 ## 🏗️ 架构
 
 分层设计，每一层只依赖它下面的一层。业务代码不直接碰硬件，也不直接碰云服务。
@@ -126,6 +160,7 @@ DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
 ```
 QwenSttS/
 ├─ app/
+│  ├─ main.py              # 应用主入口（VSCode F5 就跑它）
 │  ├─ config.py            # 全局配置（.env + 默认值）
 │  ├─ core/                # L1 基础层
 │  │  ├─ errors.py         #   统一异常类型
@@ -139,6 +174,7 @@ QwenSttS/
 │  ├─ agent/               # L4 工具池      （M5）
 │  ├─ orchestrator/        # L5 编排层      （M3）
 │  └─ ui/                  # L6 表现层      （M4）
+├─ .vscode/                # 调试配置（团队共享，已入库）
 ├─ tools/
 │  └─ check_env.py         # M1 环境自检脚本
 ├─ models/                 # 离线模型（不入库，运行时下载）
