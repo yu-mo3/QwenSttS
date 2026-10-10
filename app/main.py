@@ -43,8 +43,8 @@ BANNER = """
 MILESTONES = [
     ("M1", "工程骨架 · L1 基础层 · L2 设备层", "done"),
     ("M2", "L4 能力层：语音识别 → 对话 → 语音合成", "done"),
-    ("M3", "L3+L5：离线唤醒 · VAD 断句 · 连续对话 · 打断", "doing"),
-    ("M4", "L6 表现层：PySide6 桌面界面", "todo"),
+    ("M3", "L3+L5：离线唤醒 · VAD 断句 · 连续对话 · 打断", "done"),
+    ("M4", "L6 表现层：PySide6 桌面界面", "doing"),
     ("M5", "视觉理解 · Agent 工具池 · 打包分发", "todo"),
 ]
 
@@ -176,7 +176,7 @@ def cmd_run(config: Config) -> int:
     print()
     print("       · 免按钮对话     →  python tools/m3_assistant.py")
     print()
-    print("     M4 将接入：PySide6 图形界面。")
+    print("     图形界面       →  python -m app.ui   （或 VSCode 按 F5）")
     print()
     print("  ──────────────────────────────────────────────────")
     return 0

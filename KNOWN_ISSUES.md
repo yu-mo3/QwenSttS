@@ -88,29 +88,28 @@
 
 ---
 
-### KI-006 · 编排层的事件定义重复、载荷不一致
+### ~~KI-006 · 编排层的事件定义重复、载荷不一致~~ ✅ M4 已解决
 
 | 项 | 内容 |
 |---|---|
 | **来源** | M3 审查 · X14 / X15（🟢 可以不管） |
-| **位置** | `app/orchestrator/pipeline.py` 与 `assistant.py` |
-| **问题** | ① 事件常量、`EventCallback`、`TurnResult` 各定义一份；② 同名事件 `tts_done` 的载荷不一致（pipeline 带 `total`，assistant 不带）；③ `assistant` 里有只写不读的字段 |
-| **影响** | 无功能影响。但 **M4 的 UI 若统一订阅事件、又依赖 `payload['total']`，会 KeyError** |
-| **为什么不修** | 两个编排器当前各自独立可用；抽公共模块要动 M2 已在用的代码，收益低于风险 |
-| **何时重做** | **M4 做界面时一并处理** —— 那时会有统一的订阅层，正好借机收敛事件定义 |
+| **原问题** | ① 事件常量、`EventCallback`、`TurnResult` 各定义一份；② 同名事件 `tts_done` 的载荷不一致（pipeline 带 `total`，assistant 不带） |
+| **何时重做** | 原计划「M4 做界面时一并处理」 |
+| **✅ 结果** | M4-1 抽出 `app/orchestrator/events.py`：事件名 + 载荷契约 + `EventCallback` + 共用 `TurnResult` 全部收敛。assistant 的 `tts_done` 补上 `total` |
+| **怎么防止再漂移** | 光靠「记得同步改」是靠不住的。新增 21 条契约测试，用 **ast 静态扫描**两个编排器的每一次 `_emit`，逐个比对载荷键；另有一条断言「定义了却从不发出的事件」—— 这条当场就抓出了 M3 遗留的死常量 `EVT_SPEECH_START` |
+| **回归测试** | `tests/test_events_pure.py`（21 条） |
 
 ---
 
-### KI-007 · run() 不可重入等 API 层面小坑
+### ~~KI-007 · run() 不可重入等 API 层面小坑~~ ✅ M4 已解决
 
 | 项 | 内容 |
 |---|---|
 | **来源** | M3 审查 · X16（🟢 可以不管） |
-| **位置** | `app/orchestrator/assistant.py` / `app/audio/player.py` |
-| **问题** | ① `run()` 第二次调用会抛 `InvalidTransition`（退出 → 待机），且它在 `try` 之外、不属于 `AyuanError`；② `Speaker.stop()` 不闭锁，句间窗口发出的停止请求会被 `play()` 入口的 `clear()` 吞掉；③ `default_config(config=...)` 的 config 参数未使用 |
-| **影响** | 正常用法（一次会话一次 `run()`）不受影响 |
-| **为什么不修** | ② 在实测中未造成可感知问题（播报中调 stop 是有效的）；①③ 属于 API 洁癖 |
-| **何时重做** | M4 需要「重新开始会话」或「暂停/恢复」时 |
+| **原问题** | ① `run()` 第二次调用抛 `InvalidTransition`（退出 → 待机），且异常在 `try` 之外、不属于 `AyuanError`；② `Speaker.stop()` 不闭锁，句间窗口发出的停止请求被 `play()` 入口的 `clear()` 吞掉 |
+| **何时重做** | 原计划「M4 需要重新开始会话时」 |
+| **✅ 结果** | ① `run()` 可重入：EXITING → IDLE 交给 `_begin_new_session()`，不再喂给转换表（同一会话内它确实非法，跨会话则是合法的重置语义）；并发调用明确报 `AyuanError`；`InvalidTransition` 归入 `AyuanError` 家族 ② `Speaker.stop()` 改为无条件闭锁，由 `play()` 入口消费或 `clear_stop()` 清除 |
+| **回归测试** | `test_assistant_pure.py::TestRunReentrancy`、`test_audio_pure.py::TestSpeakerStopLatch`（7 条） |
 
 ---
 ## 已修复（留存索引）
@@ -132,3 +131,6 @@
 | M3 审查 X4 | 静默超时从不触发 | `test_assistant_pure.py::TestIdleTimeout` |
 | M3 审查 X6 | `--threshold` 是静默空操作 | `test_assistant_pure.py::TestThresholdParameter` |
 | M3 审查 X8 | 合成全空被当成成功 | `test_assistant_pure.py::TestEmptySynthesis` |
+| M4 自查 | 打字发送后用户气泡出现两次（界面与事件流各记一笔） | `test_ui_pure.py::TestInputRow::test_sending_does_not_double_up_the_bubble` |
+| M4 自查 | 光晕与涟漪溢出控件被裁成方形暗边 | `test_ui_pure.py::TestOrbFitsInsideItsWidget`（3 条） |
+| M4 自查 | `timings["合计"]` 被存下来又被求和，合计虚高 | `test_events_pure.py::test_orchestrators_never_store_the_timing_total` |
