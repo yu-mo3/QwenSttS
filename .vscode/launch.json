@@ -26,7 +26,9 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/tools/check_env.py",
-      "args": ["--no-record"],
+      "args": [
+        "--no-record"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe"
@@ -36,7 +38,24 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/app/main.py",
-      "args": ["--devices"],
+      "args": [
+        "--devices"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
+      "name": "🎙️ 录音采样（唤醒词验证）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/record_sample.py",
+      "args": [
+        "--label",
+        "ayuan",
+        "--count",
+        "5"
+      ],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "python": "${workspaceFolder}/.venv/Scripts/python.exe"
