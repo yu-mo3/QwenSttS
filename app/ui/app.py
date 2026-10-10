@@ -32,6 +32,7 @@ from app.core.logger import ensure_utf8_stdout, get_logger, setup_logging  # noq
 from app.ui import theme  # noqa: E402
 from app.ui.controller import SessionController  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
+from app.ui.tray import AyuanTray  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -106,6 +107,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     window = MainWindow(config, controller)
+
+    # 托盘要留一个强引用 —— 只被局部变量持有的 QObject 会被 GC 掉，
+    # 表现是「图标闪一下就没了」，而且不会有任何报错
+    tray = AyuanTray(window, parent=app)
+    if tray.show():
+        window.tray = tray
+        # 有托盘时，关掉窗口不等于退出程序 —— 她还在待命
+        app.setQuitOnLastWindowClosed(False)
+    else:
+        log.info("没有系统托盘，关窗即退出")
+
     window.show()
 
     if args.no_session:

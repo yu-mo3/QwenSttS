@@ -26,6 +26,7 @@ import pytest
 pytest.importorskip("PySide6", reason="界面测试需要 PySide6")
 import app.ui  # noqa: E402, F401
 
+from PySide6.QtGui import QCloseEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from app.config import Config  # noqa: E402
@@ -61,6 +62,7 @@ from app.config import Config, PerceptionSettings, sanitize_env_value, update_en
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
 from app.ui.settings_panel import SettingsDialog  # noqa: E402
 from app.ui.tech_panel import LevelTrace, TechPanel  # noqa: E402
+from app.ui.tray import AyuanTray, make_icon  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -1150,4 +1152,174 @@ class TestSettingsButton:
         )
         window.settings_button.click()
         assert opened, "点「设置」应当弹出设置面板"
+
+
+# ══════════════════════════════════════════════════════
+#  托盘
+# ══════════════════════════════════════════════════════
+
+class TestTrayIcon:
+    def test_icon_is_painted_for_every_state(self, qapp):
+        for state in AssistantState:
+            icon = make_icon(state)
+            assert not icon.isNull(), f"{state} 的图标是空的"
+
+    def test_icon_actually_has_pixels(self, qapp):
+        """isNull() 为假不代表画上了东西 —— 全透明的图也是「有效」的。"""
+        pixmap = make_icon(AssistantState.SPEAKING).pixmap(64, 64).toImage()
+        opaque = sum(
+            1
+            for x in range(0, 64, 4)
+            for y in range(0, 64, 4)
+            if pixmap.pixelColor(x, y).alpha() > 0
+        )
+        assert opaque > 0, "图标是全透明的"
+
+    def test_states_get_different_colours(self, qapp):
+        idle = make_icon(AssistantState.IDLE).pixmap(64, 64).toImage().pixelColor(32, 32)
+        speaking = (
+            make_icon(AssistantState.SPEAKING).pixmap(64, 64).toImage().pixelColor(32, 32)
+        )
+        assert idle != speaking, "不同状态该有不同颜色"
+
+
+class _FakeSignal:
+    """够用的信号替身：只记录连上来的槽。"""
+
+    def __init__(self):
+        self.slots: list = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+
+class _FakeTrayIcon:
+    """替身：不真的挂到系统托盘上（CI 里根本没有托盘）。"""
+
+    def __init__(self, *args, **kwargs):
+        self.tooltip = ""
+        self.icon = None
+        self.shown = False
+        self.activated = _FakeSignal()
+
+    def setToolTip(self, text):
+        self.tooltip = text
+
+    def setIcon(self, icon):
+        self.icon = icon
+
+    def setContextMenu(self, menu):
+        self.menu = menu
+
+    def show(self):
+        self.shown = True
+
+    def hide(self):
+        self.shown = False
+
+
+@pytest.fixture
+def tray(window, monkeypatch):
+    monkeypatch.setattr("app.ui.tray.QSystemTrayIcon", _FakeTrayIcon)
+    monkeypatch.setattr(AyuanTray, "available", property(lambda self: True))
+    return AyuanTray(window)
+
+
+class TestAyuanTray:
+    def test_state_change_updates_icon_and_tooltip(self, tray):
+        tray.on_state_changed("待机", "说话")
+        assert "说话" in tray.icon.tooltip
+        assert tray.icon.icon is not None
+
+    def test_unknown_state_is_ignored(self, tray):
+        tray.on_state_changed("待机", "天知道")   # 不该抛
+
+    def test_toggle_hides_then_shows(self, tray):
+        window = tray.window
+        window.show()
+        tray.on_toggle_window()
+        assert not window.isVisible()
+        tray.on_toggle_window()
+        assert window.isVisible()
+
+    def test_forget_clears_memory_and_history(self, tray):
+        window = tray.window
+        window.history.add_user("你好")
+        tray.on_forget()
+        assert window.history.model.entries[-1].text == "对话记忆已清空"
+        assert len(window.history.model) == 1
+
+    def test_quit_shuts_the_window_without_asking(self, tray, monkeypatch):
+        """托盘菜单里点「退出」不该再弹一次确认框 —— 那已经是一次明确的选择。"""
+        asked: list[bool] = []
+        monkeypatch.setattr(
+            "app.ui.main_window.QMessageBox",
+            type("B", (), {"__init__": lambda self, *a, **k: asked.append(True)}),
+        )
+        tray.on_quit()
+        assert tray.window._closing is True
+        assert not asked, "托盘的退出不该再弹确认框"
+
+
+class TestCloseBehaviour:
+    """关窗那三选一。
+
+    模态框不能真的弹 —— 测试里会直接把进程挂住。用一个只记录按钮的替身。
+    """
+
+    def _patch(self, monkeypatch, chosen: str | None):
+        picked: dict = {}
+
+        class FakeBox(QMessageBox):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.seen: list[tuple[str, bool]] = []
+
+            def exec(self) -> int:
+                self.seen = [(b.text(), b.isEnabled()) for b in self.buttons()]
+                for button in self.buttons():
+                    if button.text() == chosen:
+                        picked["button"] = button
+                picked["box"] = self
+                return 0
+
+            def clickedButton(self):
+                return picked.get("button")
+
+        monkeypatch.setattr("app.ui.main_window.QMessageBox", FakeBox)
+        return picked
+
+    def test_without_a_tray_hiding_is_disabled(self, window, monkeypatch):
+        """没有托盘时把窗口藏起来，用户就再也找不回来了 —— 只能禁用这个选项。"""
+        window.tray = None
+        picked = self._patch(monkeypatch, None)
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        buttons = dict(picked["box"].seen)
+        assert buttons.get("收进托盘") is False
+        assert event.isAccepted() is False
+
+    def test_choosing_quit_closes(self, window, monkeypatch):
+        window.tray = None
+        self._patch(monkeypatch, "退出")
+        event = QCloseEvent()
+        window.closeEvent(event)
+        assert event.isAccepted() is True
+        assert window._closing is True
+
+    def test_choosing_cancel_keeps_her_running(self, window, monkeypatch):
+        window.tray = None
+        self._patch(monkeypatch, "取消")
+        event = QCloseEvent()
+        window.closeEvent(event)
+        assert event.isAccepted() is False
+        assert window._closing is False
+
+    def test_request_shutdown_skips_the_dialog(self, window, monkeypatch):
+        asked = self._patch(monkeypatch, None)
+        window.request_shutdown()
+        assert window._closing is True
+        assert "box" not in asked, "request_shutdown 不该弹确认框"
 

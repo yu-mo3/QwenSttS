@@ -75,6 +75,8 @@ class MainWindow(QMainWindow):
         self._mic_level = 0.0
         self._speaker_level = 0.0
         self._closing = False
+        # 托盘在 app.py 里挂上（它是可选的，测试里不需要）
+        self.tray = None
 
         self.setWindowTitle("阿源 · QwenSttS")
         self.resize(theme.WINDOW_DEFAULT_WIDTH, theme.WINDOW_DEFAULT_HEIGHT)
@@ -380,25 +382,51 @@ class MainWindow(QMainWindow):
     # ══════════════════════════════════════════════════════
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 — Qt 的命名
+        """关窗时问一句。
+
+        三选一而不是「是/否」：常驻助手既有「收起来待命」也有「真的退出」
+        两种合理诉求，只给一个是/否会把另一种逼成「去任务管理器杀进程」——
+        而那时麦克风还占着。
+
+        托盘不可用时「收进托盘」会被禁用而不是静默隐藏窗口：
+        藏起来又找不回来是最糟糕的一种结果。
+        """
         if self._closing:
             event.accept()
             return
 
-        answer = QMessageBox.question(
-            self,
-            "退出阿源？",
-            "要退出阿源吗？退出后麦克风会立即归还给系统。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer is not QMessageBox.StandardButton.Yes:
-            event.ignore()
-            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("关闭阿源")
+        box.setText("要把阿源收进托盘，还是直接退出？")
 
-        self._closing = True
-        event.accept()
+        to_tray = box.addButton("收进托盘", QMessageBox.ButtonRole.AcceptRole)
+        quit_now = box.addButton("退出", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+
+        if self.tray is not None and self.tray.available:
+            box.setInformativeText("收进托盘后她仍在待命，喊一声「阿源」依然能唤醒。")
+            box.setDefaultButton(to_tray)
+        else:
+            to_tray.setEnabled(False)
+            box.setInformativeText("系统托盘不可用，只能退出或取消。")
+            box.setDefaultButton(cancel)
+
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is quit_now:
+            self._closing = True
+            event.accept()
+        elif clicked is to_tray and to_tray.isEnabled():
+            event.ignore()
+            self.hide()
+            if self.tray is not None:
+                self.tray.show_action.setText("显示窗口")
+        else:
+            event.ignore()
 
     def request_shutdown(self) -> None:
-        """外部（托盘）要求退出时走这条路，跳过确认框。"""
+        """外部（托盘菜单、测试）要求退出时走这条路，跳过确认框。"""
         self._closing = True
         self.close()
