@@ -14,6 +14,7 @@ VoiceAssistant.run() 是一个永不返回的帧循环（直到收到退出指�
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 from PySide6.QtCore import QObject
 
@@ -140,6 +141,28 @@ class SessionController(QObject):
         if alive:
             log.warning("会话线程在 %.1fs 内没有退出，放弃等待", timeout)
         return not alive
+
+    def apply_devices(self, *, input_device: str = "", output_device: str = "") -> None:
+        """换设备并重开会话。
+
+        麦克风与扬声器只在 run() 开始时打开一次，所以换设备**没有**第二条路，
+        必然是一次完整的会话重启。界面上把这一点写清楚，用户才不会以为
+        「点一下马上就换好了」。
+        """
+        self.config = replace(
+            self.config,
+            audio=replace(
+                self.config.audio,
+                input_device=input_device,
+                output_device=output_device,
+            ),
+        )
+        log.info(
+            "切换音频设备：输入=%r 输出=%r，重开会话",
+            input_device or "（系统默认）",
+            output_device or "（系统默认）",
+        )
+        self.restart()
 
     def restart(self) -> None:
         """结束当前会话并重开一个（托盘菜单与「应用设备设置」用）。

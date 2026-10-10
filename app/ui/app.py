@@ -56,8 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--idle",
         type=float,
-        default=DEFAULT_IDLE_TIMEOUT,
-        help="静默多少秒回待机（默认 30）",
+        default=None,
+        help="静默多少秒回待机（默认取 .env 里的 AYUAN_IDLE_TIMEOUT，再默认 30）",
     )
     parser.add_argument(
         "--threshold", type=float, default=None, help="唤醒阈值（默认 0.2）"
@@ -88,11 +88,22 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationDisplayName("阿源 · QwenSttS")
     app.setStyleSheet(theme.stylesheet())
 
+    # 命令行 > .env > 代码默认值 —— 与 Config 的优先级保持一致
     controller = SessionController(
         config,
-        idle_timeout=args.idle,
-        wake_threshold=args.threshold,
-        stop_threshold=args.stop_threshold,
+        idle_timeout=(
+            args.idle if args.idle is not None else config.perception.idle_timeout
+        ),
+        wake_threshold=(
+            args.threshold
+            if args.threshold is not None
+            else config.perception.wake_threshold
+        ),
+        stop_threshold=(
+            args.stop_threshold
+            if args.stop_threshold is not None
+            else config.perception.effective_stop_threshold
+        ),
     )
     window = MainWindow(config, controller)
     window.show()

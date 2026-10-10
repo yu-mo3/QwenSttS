@@ -47,6 +47,7 @@ from app.ui.bridge import SOURCE_MIC, gui_thread
 from app.ui.controller import SessionController
 from app.ui.history import HistoryPanel
 from app.ui.orb import OrbWidget
+from app.ui.settings_panel import SettingsDialog
 from app.ui.tech_panel import TechPanel
 
 log = get_logger(__name__)
@@ -214,6 +215,7 @@ class MainWindow(QMainWindow):
         b.session_stopped.connect(self.on_session_stopped)
         b.event_received.connect(self.on_event_received)
 
+        self.settings_button.clicked.connect(self.on_settings_clicked)
         self.listen_button.clicked.connect(self.on_listen_clicked)
         self.stop_button.clicked.connect(self.on_stop_clicked)
         self.input.returnPressed.connect(self.on_send_clicked)
@@ -343,6 +345,14 @@ class MainWindow(QMainWindow):
         # 这里**不能**自己往历史里加一条 —— 打字输入会走完整的一轮，
         # 编排层随后会发 asr_done(source=typed)，on_user_said 再渲染一次。
         # 两边都写就会出现两个一模一样的用户气泡（M4-5 修）。
+
+    @gui_thread
+    def on_settings_clicked(self) -> None:
+        dialog = SettingsDialog(self.config, self.controller, self)
+        dialog.exec()
+        # 设置可能在对话框里被改过（阈值/超时/设备），面板要跟着刷新
+        if self._tech_body.isVisible():
+            self.refresh_environment()
 
     @gui_thread
     def on_input_changed(self, text: str) -> None:

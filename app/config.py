@@ -168,6 +168,56 @@ class ModelSettings:
 
 
 # ══════════════════════════════════════════════════════════
+#  感知与交互
+# ══════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class PerceptionSettings:
+    """唤醒 / 打断 / 静默超时（纯值对象，不读环境）。
+
+    这三个值原先只存在于命令行参数里（tools/m3_assistant.py --threshold），
+    界面化之后必须有个正式归属 —— 否则 M4 的设置面板要么没法保存，
+    要么就得自己另造一套配置来源，那是「两个事实来源」的老问题。
+
+    stop_threshold 为 None 表示「与唤醒阈值相同」。这不是偷懒：
+    实测两者能触发的区间本来就是同一个（0.01~0.2），
+    分开设默认值只会让用户多调一个不知道该怎么调的旋钮。
+    """
+
+    wake_threshold: float = 0.2
+    stop_threshold: float | None = None
+    idle_timeout: float = 30.0
+
+    @property
+    def effective_stop_threshold(self) -> float:
+        return (
+            self.wake_threshold
+            if self.stop_threshold is None
+            else self.stop_threshold
+        )
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "PerceptionSettings":
+        env = os.environ if env is None else env
+        raw_stop = _read_str(env, "AYUAN_STOP_THRESHOLD")
+        return cls(
+            wake_threshold=_read_float(env, "AYUAN_WAKE_THRESHOLD", cls.wake_threshold),
+            stop_threshold=float(raw_stop) if _is_number(raw_stop) else None,
+            idle_timeout=_read_float(env, "AYUAN_IDLE_TIMEOUT", cls.idle_timeout),
+        )
+
+
+def _is_number(raw: str) -> bool:
+    if not raw:
+        return False
+    try:
+        float(raw)
+    except ValueError:
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════
 #  密钥
 # ══════════════════════════════════════════════════════════
 
@@ -205,6 +255,7 @@ class Config:
 
     audio: AudioSettings = field(default_factory=AudioSettings)
     model: ModelSettings = field(default_factory=ModelSettings)
+    perception: PerceptionSettings = field(default_factory=PerceptionSettings)
     secrets: Secrets = field(default_factory=Secrets)
     log_level: str = "INFO"
     project_root: Path = PROJECT_ROOT
@@ -221,6 +272,7 @@ class Config:
         return cls(
             audio=AudioSettings.from_env(env),
             model=ModelSettings.from_env(env),
+            perception=PerceptionSettings.from_env(env),
             secrets=Secrets.from_env(env),
             log_level=_read_str(env, "AYUAN_LOG_LEVEL", "INFO").upper(),
         )
@@ -229,3 +281,76 @@ class Config:
         """创建运行时需要的目录。"""
         for path in (self.data_dir, self.models_dir):
             path.mkdir(parents=True, exist_ok=True)
+
+
+# ══════════════════════════════════════════════════════════
+#  .env 回写
+# ══════════════════════════════════════════════════════════
+
+def sanitize_env_value(value: object) -> str:
+    """把值规整成能安全放进 .env 单行的形式。
+
+    **换行必须被吃掉**：一个带 \n 的值会把后面的内容变成新的配置行，
+    等于让调用方（以及将来的任何输入源）能往用户的 .env 里注入任意键。
+    """
+    text = "" if value is None else str(value)
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+def update_env_file(
+    updates: Mapping[str, object],
+    path: Path | None = None,
+) -> Path:
+    """把若干键写回 .env，**保留其它所有行与注释的原样**。
+
+    为什么是行级改写而不是重新生成整个文件：.env 里可能有人手写的注释、
+    临时开关、别的工具用的键。重新生成等于把它们全删了，而用户往往
+    要到下一次调试才发现。
+
+    为什么不另建一份 json 设置文件：配置只能有**一个**事实来源。
+    界面把值写进 json、启动时读的却是 .env，两边不一致时
+    谁也说不清「现在到底用的哪个」。
+
+    写入走「先写临时文件再替换」：中途崩溃时不会留下一个被截断的
+    .env —— 那会把用户的密钥一起弄丢。
+    """
+    target = ENV_FILE if path is None else Path(path)
+
+    existing: list[str] = []
+    if target.exists():
+        existing = target.read_text(encoding="utf-8").splitlines()
+
+    remaining = {key: sanitize_env_value(value) for key, value in updates.items()}
+
+    lines: list[str] = []
+    for line in existing:
+        key = _env_key_of(line)
+        if key is not None and key in remaining:
+            lines.append(f"{key}={remaining.pop(key)}")
+        else:
+            lines.append(line)
+    # 文件末尾原本没有换行时也不强行补空行，保持「改了几行就只动那几行」
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}")
+
+    content = "\n".join(lines)
+    if content:
+        content += "\n"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(target.name + ".tmp")
+    temp.write_text(content, encoding="utf-8")
+    temp.replace(target)
+    log.info("已把 %d 项设置写回 %s", len(updates), target.name)
+    return target
+
+
+def _env_key_of(line: str) -> str | None:
+    """从一行 .env 里取出键名；不是赋值行就返回 None。"""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith("export "):
+        key = key[len("export ") :].strip()
+    return key or None

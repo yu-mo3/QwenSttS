@@ -26,7 +26,7 @@ import pytest
 pytest.importorskip("PySide6", reason="界面测试需要 PySide6")
 import app.ui  # noqa: E402, F401
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from app.config import Config  # noqa: E402
 from app.orchestrator.events import (  # noqa: E402
@@ -57,7 +57,9 @@ from app.ui.history import (  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.bridge import SOURCE_MIC, SOURCE_SPEAKER  # noqa: E402
 from app.ui.controller import DEFAULT_WAKE_THRESHOLD  # noqa: E402
+from app.config import Config, PerceptionSettings, sanitize_env_value, update_env_file  # noqa: E402
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
+from app.ui.settings_panel import SettingsDialog  # noqa: E402
 from app.ui.tech_panel import LevelTrace, TechPanel  # noqa: E402
 
 
@@ -885,4 +887,267 @@ class TestEnvironmentReport:
         from app.perception.wakeword import DEFAULT_THRESHOLD
 
         assert DEFAULT_WAKE_THRESHOLD == DEFAULT_THRESHOLD
+
+
+# ══════════════════════════════════════════════════════
+#  .env 回写
+# ══════════════════════════════════════════════════════
+
+class TestEnvFileWriter:
+    """行级改写。
+
+    直接重新生成整个 .env 会把用户手写的注释、临时开关、别的工具用的键
+    全删掉 —— 而用户往往要到下一次调试才发现。
+    """
+
+    def _write(self, tmp_path, text: str):
+        path = tmp_path / ".env"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_replaces_in_place_and_keeps_the_rest(self, tmp_path):
+        path = self._write(
+            tmp_path,
+            "# 我的注释\nDASHSCOPE_API_KEY=sk-abc\nAYUAN_WAKE_THRESHOLD=0.2\nOTHER=1\n",
+        )
+        update_env_file({"AYUAN_WAKE_THRESHOLD": "0.35"}, path)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[0] == "# 我的注释"
+        assert lines[1] == "DASHSCOPE_API_KEY=sk-abc"
+        assert lines[2] == "AYUAN_WAKE_THRESHOLD=0.35"
+        assert lines[3] == "OTHER=1"
+
+    def test_appends_unknown_keys(self, tmp_path):
+        path = self._write(tmp_path, "A=1\n")
+        update_env_file({"AYUAN_IDLE_TIMEOUT": "20"}, path)
+        assert path.read_text(encoding="utf-8").splitlines() == ["A=1", "AYUAN_IDLE_TIMEOUT=20"]
+
+    def test_creates_the_file_when_missing(self, tmp_path):
+        path = tmp_path / "sub" / ".env"
+        update_env_file({"A": "1"}, path)
+        assert path.read_text(encoding="utf-8") == "A=1\n"
+
+    def test_newlines_cannot_inject_keys(self, tmp_path):
+        """一个带换行的值会把后面的内容变成新的配置行 —— 等于任意键注入。"""
+        path = self._write(tmp_path, "A=1\n")
+        update_env_file({"A": "1\nDASHSCOPE_API_KEY=stolen"}, path)
+        assert path.read_text(encoding="utf-8").splitlines() == ["A=1 DASHSCOPE_API_KEY=stolen"]
+
+    def test_carriage_return_is_also_neutralised(self, tmp_path):
+        path = self._write(tmp_path, "A=1\n")
+        update_env_file({"A": "x\ry"}, path)
+        assert "\r" not in path.read_text(encoding="utf-8")
+
+    def test_comments_and_blank_lines_survive(self, tmp_path):
+        path = self._write(tmp_path, "# c1\n\nA=1\n\n# c2\n")
+        update_env_file({"A": "2"}, path)
+        assert path.read_text(encoding="utf-8").splitlines() == ["# c1", "", "A=2", "", "# c2"]
+
+    def test_export_style_lines_are_recognised(self, tmp_path):
+        path = self._write(tmp_path, "export A=1\n")
+        update_env_file({"A": "2"}, path)
+        assert path.read_text(encoding="utf-8").splitlines() == ["A=2"]
+
+    def test_idempotent(self, tmp_path):
+        path = self._write(tmp_path, "A=1\nB=2\n")
+        update_env_file({"A": "9"}, path)
+        first = path.read_text(encoding="utf-8")
+        update_env_file({"A": "9"}, path)
+        assert path.read_text(encoding="utf-8") == first
+
+    def test_no_temp_file_is_left_behind(self, tmp_path):
+        path = self._write(tmp_path, "A=1\n")
+        update_env_file({"A": "2"}, path)
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_multiple_keys_at_once(self, tmp_path):
+        path = self._write(tmp_path, "A=1\n")
+        update_env_file({"A": "2", "B": "3"}, path)
+        assert path.read_text(encoding="utf-8").splitlines() == ["A=2", "B=3"]
+
+    def test_sanitize_strips_whitespace(self):
+        assert sanitize_env_value("  x  ") == "x"
+        assert sanitize_env_value(None) == ""
+
+
+# ══════════════════════════════════════════════════════
+#  感知参数的配置归属
+# ══════════════════════════════════════════════════════
+
+class TestPerceptionSettings:
+    def test_defaults(self):
+        settings = PerceptionSettings()
+        assert settings.wake_threshold == 0.2
+        assert settings.stop_threshold is None
+        assert settings.idle_timeout == 30.0
+
+    def test_stop_falls_back_to_wake(self):
+        assert PerceptionSettings(wake_threshold=0.15).effective_stop_threshold == 0.15
+
+    def test_stop_can_differ(self):
+        settings = PerceptionSettings(wake_threshold=0.15, stop_threshold=0.08)
+        assert settings.effective_stop_threshold == 0.08
+
+    def test_from_env(self):
+        settings = PerceptionSettings.from_env(
+            {"AYUAN_WAKE_THRESHOLD": "0.11", "AYUAN_STOP_THRESHOLD": "0.07", "AYUAN_IDLE_TIMEOUT": "12"}
+        )
+        assert settings.wake_threshold == pytest.approx(0.11)
+        assert settings.stop_threshold == pytest.approx(0.07)
+        assert settings.idle_timeout == pytest.approx(12.0)
+
+    def test_blank_stop_means_same_as_wake(self):
+        settings = PerceptionSettings.from_env({"AYUAN_WAKE_THRESHOLD": "0.11", "AYUAN_STOP_THRESHOLD": ""})
+        assert settings.stop_threshold is None
+        assert settings.effective_stop_threshold == pytest.approx(0.11)
+
+    def test_garbage_stop_falls_back(self):
+        settings = PerceptionSettings.from_env({"AYUAN_STOP_THRESHOLD": "响一点"})
+        assert settings.stop_threshold is None
+
+    def test_config_carries_it(self):
+        config = Config.load({"AYUAN_IDLE_TIMEOUT": "45"})
+        assert config.perception.idle_timeout == pytest.approx(45.0)
+
+
+# ══════════════════════════════════════════════════════
+#  控件：设置面板
+# ══════════════════════════════════════════════════════
+
+class _SettingsStubController:
+    """只记录设置变更，不真的重开会话（那会去打开麦克风）。"""
+
+    def __init__(self, config):
+        self.config = config
+        self.idle_timeout = config.perception.idle_timeout
+        self.wake_threshold = None
+        self.stop_threshold = None
+        self.applied_devices: list[tuple[str, str]] = []
+        self.restarts = 0
+
+    def set_idle_timeout(self, seconds):
+        self.idle_timeout = float(seconds)
+
+    def set_thresholds(self, *, wake=None, stop=None):
+        if wake is not None:
+            self.wake_threshold = float(wake)
+        if stop is not None:
+            self.stop_threshold = float(stop)
+
+    def apply_devices(self, *, input_device="", output_device=""):
+        self.applied_devices.append((input_device, output_device))
+        self.restarts += 1
+
+
+@pytest.fixture
+def settings_env(tmp_path):
+    """一份临时的 .env。**绝不能**让测试写到用户真正的 .env 上。"""
+    path = tmp_path / ".env"
+    path.write_text(
+        "# 用户自己写的注释\nDASHSCOPE_API_KEY=sk-should-not-change\nAYUAN_LOG_LEVEL=INFO\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestSettingsDialog:
+    def _dialog(self, qapp, env_path):
+        config = Config.load({})
+        controller = _SettingsStubController(config)
+        dialog = SettingsDialog(config, controller, env_path=env_path)
+        return dialog, controller
+
+    def test_loads_current_values(self, qapp, settings_env):
+        dialog, _controller = self._dialog(qapp, settings_env)
+        assert dialog.wake_spin.value() == pytest.approx(0.2)
+        assert dialog.idle_spin.value() == 30
+
+    def test_loading_does_not_apply_anything(self, qapp, settings_env):
+        """填初值时 valueChanged 会连着触发 —— 不加锁会把设置改一遍。"""
+        _dialog, controller = self._dialog(qapp, settings_env)
+        assert controller.wake_threshold is None
+
+    def test_changing_a_threshold_applies_immediately(self, qapp, settings_env):
+        dialog, controller = self._dialog(qapp, settings_env)
+        dialog.wake_spin.setValue(0.35)
+        assert controller.wake_threshold == pytest.approx(0.35)
+
+    def test_changing_idle_timeout_applies_immediately(self, qapp, settings_env):
+        dialog, controller = self._dialog(qapp, settings_env)
+        dialog.idle_spin.setValue(20)
+        assert controller.idle_timeout == pytest.approx(20.0)
+
+    def test_saving_preserves_the_rest_of_the_file(self, qapp, settings_env, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        dialog, _controller = self._dialog(qapp, settings_env)
+        dialog.on_save()
+
+        text = settings_env.read_text(encoding="utf-8")
+        assert "# 用户自己写的注释" in text, "注释必须原样保留"
+        assert "DASHSCOPE_API_KEY=sk-should-not-change" in text, "密钥不该被碰"
+        assert "AYUAN_LOG_LEVEL=INFO" in text
+        assert "AYUAN_IDLE_TIMEOUT=30" in text
+
+    def test_saving_round_trips_into_config(self, qapp, settings_env, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        dialog, _controller = self._dialog(qapp, settings_env)
+        dialog.wake_spin.setValue(0.12)
+        dialog.idle_spin.setValue(18)
+        dialog.on_save()
+
+        env = {}
+        for line in settings_env.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                env[key] = value
+
+        reloaded = Config.load(env)
+        assert reloaded.perception.wake_threshold == pytest.approx(0.12)
+        assert reloaded.perception.idle_timeout == pytest.approx(18.0)
+
+    def test_apply_devices_goes_through_the_controller(self, qapp, settings_env, monkeypatch):
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+        dialog, controller = self._dialog(qapp, settings_env)
+        dialog.input_combo.setCurrentText("我的麦克风")
+        dialog.on_apply_devices()
+        assert controller.applied_devices == [("我的麦克风", "")]
+
+    def test_revert_puts_the_device_fields_back(self, qapp, settings_env):
+        """「恢复当前值」真正有用的是设备框 —— 阈值是改一下立刻生效的，
+        没有「未提交」这个状态；设备框则是填好了等用户点应用。"""
+        dialog, _controller = self._dialog(qapp, settings_env)
+        dialog.input_combo.setCurrentText("随手填的设备名")
+        dialog.revert_button.click()
+        assert dialog.input_combo.currentText() == ""
+
+    def test_revert_shows_whatever_is_currently_live(self, qapp, settings_env):
+        """填初值取的是**正在生效**的值，不是配置文件里的初值 ——
+        否则用户改完阈值再打开设置，会看到滑块弹回旧位置。"""
+        dialog, controller = self._dialog(qapp, settings_env)
+        dialog.wake_spin.setValue(0.9)
+        assert controller.wake_threshold == pytest.approx(0.9)
+        dialog.revert_button.click()
+        assert dialog.wake_spin.value() == pytest.approx(0.9)
+
+
+class _FakeSettingsDialog:
+    """替换掉真的对话框：测试里弹模态窗会直接把进程挂住。"""
+
+    def __init__(self, sink, *args, **kwargs):
+        sink.append(True)
+
+    def exec(self) -> int:
+        return 0
+
+
+class TestSettingsButton:
+    def test_the_button_opens_the_dialog(self, window, monkeypatch):
+        """按钮点了没反应是最难被发现的一类问题 —— 真的点一次，看它弹不弹。"""
+        opened: list[bool] = []
+        monkeypatch.setattr(
+            "app.ui.main_window.SettingsDialog",
+            lambda *a, **k: _FakeSettingsDialog(opened),
+        )
+        window.settings_button.click()
+        assert opened, "点「设置」应当弹出设置面板"
 
