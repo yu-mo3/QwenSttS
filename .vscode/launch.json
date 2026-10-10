@@ -1,0 +1,45 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "▶ 启动阿源",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/main.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    },
+    {
+      "name": "🔍 环境自检",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/check_env.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": false
+    },
+    {
+      "name": "🔇 环境自检（跳过录音）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/check_env.py",
+      "args": ["--no-record"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    },
+    {
+      "name": "🎧 只看音频设备",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app/main.py",
+      "args": ["--devices"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe"
+    }
+  ]
+}

@@ -46,6 +46,21 @@ class _ColorFormatter(logging.Formatter):
             record.levelname = original
 
 
+def ensure_utf8_stdout() -> None:
+    """强制 stdout / stderr 使用 UTF-8。
+
+    Windows 控制台默认是 GBK，中文与制表符会变成乱码。
+    必须在「任何输出之前」调用 —— 包括 argparse 的 --version，
+    它会在 setup_logging() 之前就打印并退出。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def _supports_color(stream) -> bool:
     return hasattr(stream, "isatty") and stream.isatty()
 
@@ -65,14 +80,9 @@ def setup_logging(
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
-    stream = sys.stdout
-    # Windows 控制台默认 GBK，中文 + ANSI 会乱码，强制 UTF-8
-    if hasattr(stream, "reconfigure"):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    ensure_utf8_stdout()
 
+    stream = sys.stdout
     console = logging.StreamHandler(stream)
     console.setFormatter(_ColorFormatter(use_color=_supports_color(stream)))
     root.addHandler(console)
