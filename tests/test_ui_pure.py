@@ -1323,3 +1323,103 @@ class TestCloseBehaviour:
         assert window._closing is True
         assert "box" not in asked, "request_shutdown 不该弹确认框"
 
+# ══════════════════════════════════════════════════════
+#  R1 回归：退出必须**真的**退出
+# ══════════════════════════════════════════════════════
+
+class TestQuitActuallyQuits:
+    """独立审查的 🔴 R1。
+
+    有系统托盘时，「退出阿源」（托盘菜单）与「退出」（关窗确认框）
+    原先只关掉了窗口：进程、会话线程、麦克风全留在后台，
+    aboutToQuit 永不触发，_shutdown 一次都没跑。
+
+    **这条缺陷 offscreen 环境测不到** —— 托盘在这儿恒为不可用，
+    app.py 走 else 分支、不设 setQuitOnLastWindowClosed(False)，关窗即退出。
+    所以回归测试不去跑真实事件循环（在这里跑不出差别），
+    而是把「退出分支有没有真的请求退出应用」这个动作钉死；
+    真实事件循环下的端到端确认由探针单独做。
+    """
+
+    def _patch_app(self, monkeypatch):
+        calls: list[str] = []
+
+        class FakeApplication:
+            @staticmethod
+            def instance():
+                return FakeApplication()
+
+            def quit(self):          # noqa: A003 - 对齐 Qt 的命名
+                calls.append("quit")
+
+        monkeypatch.setattr("app.ui.main_window.QApplication", FakeApplication)
+        return calls
+
+    def _patch_box(self, monkeypatch, chosen: str):
+        """把确认框换成「总是点某个按钮」的替身。"""
+        picked: dict = {}
+
+        class FakeBox(QMessageBox):
+            def exec(self) -> int:
+                for button in self.buttons():
+                    if button.text() == chosen:
+                        picked["button"] = button
+                return 0
+
+            def clickedButton(self):
+                return picked.get("button")
+
+        monkeypatch.setattr("app.ui.main_window.QMessageBox", FakeBox)
+
+    def test_request_shutdown_requests_application_quit(self, window, monkeypatch):
+        calls = self._patch_app(monkeypatch)
+        window.request_shutdown()
+        assert calls == ["quit"], (
+            "托盘菜单「退出阿源」必须真的请求退出应用 —— "
+            "只 close() 会留下一个没有窗口、却仍占着麦克风的幽灵进程"
+        )
+
+    def test_close_dialog_quit_button_requests_application_quit(self, window, monkeypatch):
+        calls = self._patch_app(monkeypatch)
+        self._patch_box(monkeypatch, "退出")
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert event.isAccepted() is True
+        assert calls == ["quit"], "关窗选「退出」同样必须真的退出"
+
+    def test_hiding_to_tray_does_not_quit(self, window, monkeypatch):
+        """反向断言：收进托盘是「她还活着」，绝不能顺手把程序退了。"""
+        window.tray = None
+        calls = self._patch_app(monkeypatch)
+        self._patch_box(monkeypatch, "收进托盘")
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert event.isAccepted() is False, "收进托盘时窗口不该真被关掉"
+        assert calls == [], "收进托盘不该退出应用"
+
+    def test_cancel_does_not_quit(self, window, monkeypatch):
+        window.tray = None
+        calls = self._patch_app(monkeypatch)
+        self._patch_box(monkeypatch, "取消")
+
+        event = QCloseEvent()
+        window.closeEvent(event)
+
+        assert calls == [], "取消不该退出应用"
+
+    def test_a_hidden_window_can_still_be_quit(self, window, monkeypatch):
+        """收进托盘之后再从托盘菜单退出，也必须真的退。
+
+        这是最容易漏的一条：窗口已经不可见时再走一次 close()，
+        Qt 可能把它当成空操作 —— 所以 _quit_application() 绝不能
+        依赖「窗口确实被关掉了」这件事。
+        """
+        calls = self._patch_app(monkeypatch)
+        window.hide()
+        window.request_shutdown()
+        assert calls == ["quit"]
+

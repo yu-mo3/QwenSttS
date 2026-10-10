@@ -27,6 +27,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -418,6 +419,7 @@ class MainWindow(QMainWindow):
         if clicked is quit_now:
             self._closing = True
             event.accept()
+            self._quit_application()
         elif clicked is to_tray and to_tray.isEnabled():
             event.ignore()
             self.hide()
@@ -430,3 +432,39 @@ class MainWindow(QMainWindow):
         """外部（托盘菜单、测试）要求退出时走这条路，跳过确认框。"""
         self._closing = True
         self.close()
+        self._quit_application()
+
+    def _quit_application(self) -> None:
+        """真的退出应用。
+
+        ## 为什么必须是显式的（R1，独立审查的 🔴）
+
+        「窗口 close()」和「应用退出」是**两件事**。app.py 为了让
+        「收进托盘」之后程序继续待命，设了
+        `setQuitOnLastWindowClosed(False)` —— 于是退出分支里那一句
+        `event.accept()` 只关掉了窗口：进程活着、会话线程活着、
+        **麦克风一直被占着**，而 `aboutToQuit` 永不触发，
+        挂在它上面的 `_shutdown` 一次都没跑过。
+
+        用户眼前已经没有窗口了，界面上也没有第二个退出入口 ——
+        只能去任务管理器杀进程。而关窗对话框上还写着
+        「退出会立刻把麦克风还给系统」。
+
+        ## 为什么这个缺陷 372 条测试一条都没拦住
+
+        offscreen 平台 `QSystemTrayIcon.isSystemTrayAvailable()` 恒为 False，
+        于是 app.py 走 else 分支**不设**那个开关，关窗即退出。
+        **它只在有真实桌面的机器上出现，而自动化测试永远跑在没有桌面的环境里。**
+        回归测试因此只能盯住「有没有真的请求退出」这个动作本身，
+        见 tests/test_ui_pure.py::TestQuitActuallyQuits。
+
+        ## 这里是 belt-and-braces
+
+        显式 quit 之外，`quitOnLastWindowClosed` 仍是默认的 True 还是 False
+        都不影响正确性：收进托盘走的是 `event.ignore()` + `hide()`，
+        本来就不触发退出。两条路都留着，是为了将来有人再加一条退出路径时，
+        少写一句也不会退回「幽灵进程」。
+        """
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()

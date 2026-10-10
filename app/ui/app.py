@@ -113,7 +113,14 @@ def main(argv: list[str] | None = None) -> int:
     tray = AyuanTray(window, parent=app)
     if tray.show():
         window.tray = tray
-        # 有托盘时，关掉窗口不等于退出程序 —— 她还在待命
+        # 有托盘时，关掉窗口不等于退出程序 —— 她还在待命。
+        #
+        # ⚠️ 这个开关只负责「关窗不退出」，**不负责退出**：
+        # 真正的退出由 MainWindow._quit_application() 显式调用 app.quit()，
+        # 挂在 aboutToQuit 上的 _shutdown 才会跑、麦克风才会被释放。
+        # 曾经这里只有 setQuitOnLastWindowClosed(False) 而没有显式 quit()，
+        # 结果「退出阿源」只关掉了窗口，进程与麦克风全留在后台
+        # —— 见 docs/reviews/m4-review.md 的 R1。
         app.setQuitOnLastWindowClosed(False)
     else:
         log.info("没有系统托盘，关窗即退出")
