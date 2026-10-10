@@ -1,0 +1,27 @@
+# ============================================================
+#  Git attributes
+# ============================================================
+
+# Windows batch files MUST use CRLF, otherwise cmd.exe may
+# mis-parse them. They must also stay pure ASCII: cmd.exe reads
+# .bat files using the OEM code page (GBK on zh-CN), so UTF-8
+# Chinese comments corrupt the script.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Source code and docs use LF
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+
+# Binaries: no newline conversion
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.wav   binary
+*.mp3   binary
+*.onnx  binary
