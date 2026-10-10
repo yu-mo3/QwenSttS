@@ -35,6 +35,19 @@ log = get_logger(__name__)
 #: 到点还没结束就放弃等待 —— 界面必须能关掉，哪怕后台线程有问题。
 STOP_TIMEOUT = 3.0
 
+#: 与 app/perception/wakeword.py 的 DEFAULT_THRESHOLD 保持一致。
+#: 不直接 import 那个模块：它会连带拉起 sherpa_onnx，而界面在没装模型时
+#: 也该能打开。这条重复是有意的，测试里有一条断言把它们钉在一起。
+DEFAULT_WAKE_THRESHOLD = 0.2
+
+
+def _describe(device) -> str:
+    """把设备描述成一行。设备为 None 时说明它意味着什么。"""
+    if device is None:
+        return "（系统默认）"
+    suffix = "  ← 免提模式·音质差" if device.is_handsfree else ""
+    return f"[{device.index}] {device.name}{suffix}"
+
 
 class SessionController(QObject):
     """持有一次语音会话。必须在 GUI 线程构造。"""
@@ -171,6 +184,70 @@ class SessionController(QObject):
         assistant = self._assistant
         if assistant is not None:
             assistant.clear_memory()
+
+    # ══════════════════════════════════════════════════════
+    #  环境摘要（技术面板用）
+    # ══════════════════════════════════════════════════════
+
+    def environment_report(self) -> list[tuple[str, list[tuple[str, str]]]]:
+        """当前设备与参数的可读摘要，按**分区**返回。
+
+        返回 [("设备", [(标签, 值), ...]), ("参数", [...])] 而不是一长条平铺，
+        是因为技术面板要按区渲染成两组；让控件去猜「从第几行开始是参数」
+        是那种改一次就错一次的耦合。
+
+        放在控制器而不是控件里：控件不该认识 app.audio.devices 与
+        app.config，而这份摘要恰好也是排障时第一眼要看的东西 ——
+        用户截一张图，开发者就能知道他用的是哪只麦克风、什么阈值。
+
+        任何一项取不到都不该让面板空掉：设备枚举在无音频硬件的机器上
+        （CI、远程桌面）会抛异常，那时显示一句「无法枚举」比整块面板消失好。
+        """
+        audio = self.config.audio
+        model = self.config.model
+
+        params: list[tuple[str, str]] = [
+            ("采样率", f"{audio.sample_rate} Hz"),
+            ("声道 / 位深", f"{audio.channels} / {audio.sample_width * 8}bit"),
+            ("帧长", f"{audio.frame_ms} ms（{audio.frame_samples} 采样点）"),
+            ("唤醒阈值", self._threshold_text(self.wake_threshold, DEFAULT_WAKE_THRESHOLD)),
+            ("停阈值", self._threshold_text(self.stop_threshold, None)),
+            ("静默超时", f"{self.idle_timeout:.0f} 秒"),
+            ("对话模型", f"{model.llm}（思考模式：{'开' if model.enable_thinking else '关'}）"),
+            ("识别模型", model.asr),
+            ("合成模型", f"{model.tts} · 音色 {model.tts_voice}"),
+            ("视觉模型", f"{model.vlm}（M5）"),
+            ("API Key", "已配置" if self.config.secrets.has_dashscope else "❌ 未配置"),
+        ]
+        return [("设备", self._device_rows()), ("参数", params)]
+
+    @staticmethod
+    def _threshold_text(value: float | None, default: float | None) -> str:
+        if value is not None:
+            return f"{value:.2f}"
+        if default is not None:
+            return f"{default:.2f}（默认）"
+        return "与唤醒阈值相同"
+
+    def _device_rows(self) -> list[tuple[str, str]]:
+        try:
+            from app.audio.devices import list_devices, suggest_route
+        except Exception as exc:  # noqa: BLE001 - 没装 sounddevice 也要能开界面
+            return [("音频设备", f"无法读取（{exc}）")]
+
+        try:
+            devices = list_devices()
+        except Exception as exc:  # noqa: BLE001 - 无音频硬件时会抛
+            return [("音频设备", f"无法枚举（{exc}）")]
+
+        route = suggest_route(devices)
+        rows = [
+            ("输入设备", _describe(route.input_device)),
+            ("输出设备", _describe(route.output_device)),
+        ]
+        if route.uses_handsfree:
+            rows.append(("⚠️ 路由", "有一端处于蓝牙免提模式，音质会下降"))
+        return rows
 
     # ══════════════════════════════════════════════════════
     #  运行中改设置

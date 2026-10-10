@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -48,12 +47,9 @@ from app.ui.bridge import SOURCE_MIC, gui_thread
 from app.ui.controller import SessionController
 from app.ui.history import HistoryPanel
 from app.ui.orb import OrbWidget
+from app.ui.tech_panel import TechPanel
 
 log = get_logger(__name__)
-
-#: 事件日志最多保留多少行。排障看最近几百条足够，
-#: 无限增长会让一个常驻一整天的助手把内存吃光。
-EVENT_LOG_LIMIT = 500
 
 #: 电平条的格子数。20 格在 380px 的栏宽里刚好够看清又不占地方。
 _BAR_CELLS = 20
@@ -196,22 +192,8 @@ class MainWindow(QMainWindow):
         return row
 
     def _build_tech_panel(self) -> QWidget:
-        panel = QFrame()
-        panel.setObjectName("Panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(theme.PAD, theme.PAD, theme.PAD, theme.PAD)
-        layout.setSpacing(theme.GAP)
-
-        caption = QLabel("事件日志（最近 %d 条）" % EVENT_LOG_LIMIT)
-        caption.setObjectName("Dim")
-        layout.addWidget(caption)
-
-        self.event_log = QPlainTextEdit()
-        self.event_log.setReadOnly(True)
-        self.event_log.setMaximumBlockCount(EVENT_LOG_LIMIT)
-        self.event_log.setFixedHeight(180)
-        layout.addWidget(self.event_log)
-        return panel
+        self.tech = TechPanel()
+        return self.tech
 
     # ══════════════════════════════════════════════════════
     #  信号连接 —— 全部连到本窗口的绑定方法（见模块文档）
@@ -268,6 +250,7 @@ class MainWindow(QMainWindow):
         else:
             self._speaker_level = level
         self._push_orb_level()
+        self.tech.push_level(level, source)
         self.level_label.setText(
             f"🎤 {_bar(self._mic_level)}   🔊 {_bar(self._speaker_level)}"
         )
@@ -327,13 +310,7 @@ class MainWindow(QMainWindow):
 
     @gui_thread
     def on_event_received(self, event: str, payload: dict) -> None:
-        """技术面板的事件日志。
-
-        不解析、不美化，原样打一行 —— 排障时最有用的是**原始载荷**，
-        而不是别人替你总结过的版本。
-        """
-        summary = ", ".join(f"{k}={v!r}" for k, v in payload.items())
-        self.event_log.appendPlainText(f"{event:<16} {summary}")
+        self.tech.log_event(event, payload)
 
     # ══════════════════════════════════════════════════════
     #  按钮
@@ -375,6 +352,18 @@ class MainWindow(QMainWindow):
     def on_tech_toggled(self, shown: bool) -> None:
         self._tech_body.setVisible(shown)
         self._tech_toggle.setText(("▾ " if shown else "▸ ") + "技术面板")
+        if shown:
+            # 只在展开时刷新：设备枚举要动 PortAudio，
+            # 没打开面板就不该为此付出代价
+            self.refresh_environment()
+
+    @gui_thread
+    def refresh_environment(self) -> None:
+        """把设备与参数刷进技术面板。"""
+        try:
+            self.tech.set_environment(self.controller.environment_report())
+        except Exception as exc:  # noqa: BLE001 — 面板刷新失败不该影响对话
+            log.warning("刷新环境信息失败：%s", exc)
 
     # ══════════════════════════════════════════════════════
     #  关闭

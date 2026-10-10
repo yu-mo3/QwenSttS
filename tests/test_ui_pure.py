@@ -55,7 +55,10 @@ from app.ui.history import (  # noqa: E402
     format_clock,
 )
 from app.ui.main_window import MainWindow  # noqa: E402
+from app.ui.bridge import SOURCE_MIC, SOURCE_SPEAKER  # noqa: E402
+from app.ui.controller import DEFAULT_WAKE_THRESHOLD  # noqa: E402
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
+from app.ui.tech_panel import LevelTrace, TechPanel  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -274,7 +277,7 @@ class TestMainWindowSmoke:
 
     def test_event_log_records_raw_payloads(self, window):
         window.bridge.feed_event(EVT_TTS_DONE, {"index": 1, "total": 2, "duration": 0.9})
-        log_text = window.event_log.toPlainText()
+        log_text = window.tech.event_log.toPlainText()
         assert EVT_TTS_DONE in log_text
         assert "total=2" in log_text, "事件日志要原样打载荷，排障时才有用"
 
@@ -711,4 +714,175 @@ class TestInputRow:
         window.input.setText("   ")
         window.on_send_clicked()
         assert stub.submitted == []
+
+# ══════════════════════════════════════════════════════
+#  纯逻辑：电平环缓冲
+# ══════════════════════════════════════════════════════
+
+class TestLevelTrace:
+    def test_separates_the_two_sources(self):
+        trace = LevelTrace(points=8)
+        trace.push(0.1, SOURCE_MIC)
+        trace.push(0.9, SOURCE_SPEAKER)
+        assert trace.mic == (0.1,)
+        assert trace.speaker == (0.9,)
+
+    def test_keeps_only_the_newest_points(self):
+        """只留最近的点 —— 攒一辈子的电平会把常驻助手的曲线拉成一条直线。"""
+        trace = LevelTrace(points=4)
+        for index in range(9):
+            trace.push(index / 10, SOURCE_MIC)
+        assert trace.mic == (0.5, 0.6, 0.7, 0.8)
+
+    def test_two_sources_have_independent_capacity(self):
+        trace = LevelTrace(points=3)
+        for _ in range(5):
+            trace.push(0.2, SOURCE_MIC)
+        trace.push(0.7, SOURCE_SPEAKER)
+        assert len(trace.mic) == 3
+        assert trace.speaker == (0.7,)
+
+    def test_levels_are_clamped(self):
+        trace = LevelTrace(points=2)
+        trace.push(9.0, SOURCE_MIC)
+        trace.push(-9.0, SOURCE_MIC)
+        assert trace.mic == (1.0, 0.0)
+
+    def test_unknown_source_is_dropped(self):
+        """把来源不明的电平混进任一条曲线，都会让人看图得出错误结论。"""
+        trace = LevelTrace(points=4)
+        trace.push(0.5, "天知道")
+        assert trace.mic == () and trace.speaker == ()
+
+    def test_garbage_input_does_not_raise(self):
+        trace = LevelTrace(points=4)
+        trace.push("响", SOURCE_MIC)      # type: ignore[arg-type]
+        trace.push(None, SOURCE_MIC)      # type: ignore[arg-type]
+        assert trace.mic == ()
+
+    def test_clear(self):
+        trace = LevelTrace(points=4)
+        trace.push(0.5, SOURCE_MIC)
+        trace.push(0.5, SOURCE_SPEAKER)
+        trace.clear()
+        assert trace.mic == () and trace.speaker == ()
+
+    def test_capacity_is_at_least_one(self):
+        trace = LevelTrace(points=0)
+        trace.push(0.5, SOURCE_MIC)
+        assert trace.mic == (0.5,)
+
+
+# ══════════════════════════════════════════════════════
+#  控件：技术面板
+# ══════════════════════════════════════════════════════
+
+class TestTechPanel:
+    def test_log_records_the_raw_payload(self, qapp):
+        panel = TechPanel()
+        panel.log_event(EVT_TTS_DONE, {"index": 1, "total": 2, "duration": 0.9})
+        text = panel.event_log.toPlainText()
+        assert EVT_TTS_DONE in text
+        assert "total=2" in text, "载荷要原样打出来，排障时才有用"
+
+    def test_clear_log(self, qapp):
+        panel = TechPanel()
+        panel.log_event(EVT_WAKE, {})
+        panel.clear_log()
+        assert panel.event_log.toPlainText() == ""
+
+    def test_environment_rows_are_rendered(self, qapp):
+        panel = TechPanel()
+        panel.set_environment([("设备", [("输入设备", "麦克风 X")]), ("参数", [("采样率", "16000 Hz")])])
+        texts = _grid_texts(panel._device_grid) + _grid_texts(panel._param_grid)
+        assert "输入设备" in texts and "麦克风 X" in texts
+        assert "采样率" in texts and "16000 Hz" in texts
+
+    def test_environment_refresh_does_not_duplicate_rows(self, qapp):
+        """重建整张表而不是逐行追加 —— 否则每展开一次面板就多出一倍行。"""
+        panel = TechPanel()
+        rows = [("参数", [("采样率", "16000 Hz")])]
+        panel.set_environment(rows)
+        panel.set_environment(rows)
+        assert _grid_texts(panel._param_grid).count("采样率") == 1
+
+    def test_unknown_section_is_ignored(self, qapp):
+        panel = TechPanel()
+        panel.set_environment([("天知道", [("a", "b")])])   # 不该抛
+
+    def test_levels_reach_the_trace(self, qapp):
+        panel = TechPanel()
+        panel.push_level(0.4, SOURCE_MIC)
+        assert panel.trace.mic == (0.4,)
+
+    def test_waveform_paints_without_crashing(self, qapp):
+        """空曲线、单点、满曲线都要能画 —— 绘制路径崩了整个面板就没了。"""
+        from PySide6.QtGui import QPixmap
+
+        panel = TechPanel()
+        widget = panel.waveform
+        widget.resize(300, 88)
+        for fill in (0, 1, 2, LevelTrace(points=10).points):
+            widget.trace.clear()
+            for index in range(fill):
+                widget.trace.push(index / max(1, fill), SOURCE_MIC)
+            pix = QPixmap(widget.size())
+            widget.render(pix)
+
+
+def _grid_texts(grid) -> list[str]:
+    out = []
+    for index in range(grid.count()):
+        widget = grid.itemAt(index).widget()
+        if widget is not None:
+            out.append(widget.text())
+    return out
+
+
+# ══════════════════════════════════════════════════════
+#  环境摘要
+# ══════════════════════════════════════════════════════
+
+class TestEnvironmentReport:
+    def _sections(self):
+        controller = SessionController(Config.load({}), idle_timeout=42.0)
+        return {title: dict(rows) for title, rows in controller.environment_report()}
+
+    def test_has_both_sections(self):
+        sections = self._sections()
+        assert set(sections) == {"设备", "参数"}
+
+    def test_reports_the_live_settings(self):
+        """面板显示的值必须来自**当前会话**，而不是配置文件里的初值。"""
+        controller = SessionController(Config.load({}), idle_timeout=42.0)
+        controller.set_idle_timeout(15.0)
+        params = dict(controller.environment_report()[1][1])
+        assert "15" in params["静默超时"]
+
+    def test_hint_that_the_key_is_missing(self):
+        """密钥没配是新手最常见的一步之遥，面板要直接说出来。"""
+        params = self._sections()["参数"]
+        assert "未配置" in params["API Key"]
+
+    def test_device_enumeration_failure_does_not_break_the_panel(self, monkeypatch):
+        """无音频硬件的机器（CI、远程桌面）上枚举会抛 —— 不能连界面都开不了。"""
+        import app.audio.devices as devices
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("没有音频设备")
+
+        monkeypatch.setattr(devices, "list_devices", boom)
+        controller = SessionController(Config.load({}))
+        sections = dict(controller.environment_report())
+        assert "设备" in sections
+        assert any("无法枚举" in value for _label, value in sections["设备"])
+
+    def test_default_threshold_matches_the_perception_layer(self):
+        """控制器里那份默认阈值是有意重复的（为了不在开界面时拉起 sherpa_onnx）。
+
+        重复就会漂移，所以把它钉在感知层的真值上。
+        """
+        from app.perception.wakeword import DEFAULT_THRESHOLD
+
+        assert DEFAULT_WAKE_THRESHOLD == DEFAULT_THRESHOLD
 
