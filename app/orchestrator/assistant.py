@@ -660,8 +660,21 @@ class VoiceAssistant:
         self._begin_new_session()
 
         self._running = True
-        self._set_state(AssistantState.IDLE)
-        self.microphone.open()
+        try:
+            self._set_state(AssistantState.IDLE)
+            self.microphone.open()
+        except Exception:
+            # 打开设备失败也必须把 _running 放回去（M4 审查 R2）。
+            #
+            # 原先这两行在 try 之外：open() 一抛，下面的 finally 整段跳过，
+            # _running 永远停在 True —— 这个实例就永久不可复用了。而 M4 给
+            # run() 加的并发守卫会把它变成一句「助手已经在运行中」，
+            # 用户看到的是一句和真实原因（麦克风被占用）毫无关系的报错。
+            #
+            # 这里只回滚标志位就够了：open() 失败时流是 None，
+            # 没有需要清理的设备资源（close() 自带空值保护）。
+            self._running = False
+            raise
 
         reader = threading.Thread(target=self._reader_loop, daemon=True, name="ayuan-input")
         reader.start()

@@ -56,7 +56,11 @@ from app.ui.history import (  # noqa: E402
     format_clock,
 )
 from app.ui.main_window import MainWindow  # noqa: E402
-from app.ui.bridge import SOURCE_MIC, SOURCE_SPEAKER  # noqa: E402
+from app.ui.bridge import (  # noqa: E402
+    LOG_ONLY_EVENTS,
+    SOURCE_MIC,
+    SOURCE_SPEAKER,
+)
 from app.ui.controller import DEFAULT_WAKE_THRESHOLD  # noqa: E402
 from app.config import Config, PerceptionSettings, sanitize_env_value, update_env_file  # noqa: E402
 from app.ui.qt_runtime import ensure_qt_runtime  # noqa: E402
@@ -203,13 +207,37 @@ class TestEventBridgeMapping:
         b.feed_event("something_new", {"a": 1})
         assert seen["event"] == [("something_new", {"a": 1})]
 
-    def test_signal_map_covers_every_subscribed_event(self):
-        """对话无状态测试：SUBSCRIBED_EVENTS 里列了却没人处理的事件是死契约。"""
-        b, seen = self._bridge_with_recorder()
-        for name in sorted(SUBSCRIBED_EVENTS):
-            b.feed_event(name, {})
-        handled = {k for k in seen if k != "event"}
-        assert handled, "至少该有一个事件被专门处理"
+    def test_every_subscribed_event_has_a_signal_or_is_declared_log_only(self):
+        """M4 审查 R4：这条测试原先**是空转的**。
+
+        原名 `test_signal_map_covers_every_subscribed_event`，承诺的是覆盖度，
+        断言却只有 `assert handled`（非空）—— 14 个订阅事件里 5 个本就没有
+        专门信号，只要还剩 1 个映射就绿；把 9 个 `elif` 删到只剩 1 个，
+        它照样通过。给的是虚假信心。
+
+        现在逐个事件判定：要么它产生了专门信号，要么它在 LOG_ONLY_EVENTS
+        名单里被显式声明为「只进日志」。二者必居其一，没有第三种可能。
+        """
+        for event in sorted(SUBSCRIBED_EVENTS):
+            bridge, seen = self._bridge_with_recorder()
+            bridge.feed_event(event, {})
+            handled = {k for k in seen if k != "event"}
+
+            if event in LOG_ONLY_EVENTS:
+                assert not handled, (
+                    f"{event} 被声明为「只进日志」，却发了信号 {sorted(handled)}"
+                    " —— 名单该更新了"
+                )
+            else:
+                assert handled, (
+                    f"{event} 既没有专门信号、也不在 LOG_ONLY_EVENTS 名单里。"
+                    "要么给它接一个信号，要么在 bridge.py 里写清楚为什么不接"
+                )
+
+    def test_log_only_events_are_actually_subscribed(self):
+        """名单里不许留已经不再订阅的事件 —— 那是另一种形式的腐烂。"""
+        stale = LOG_ONLY_EVENTS - SUBSCRIBED_EVENTS
+        assert not stale, f"这些事件在 LOG_ONLY 名单里却已不在订阅列表：{sorted(stale)}"
 
 
 # ══════════════════════════════════════════════════════

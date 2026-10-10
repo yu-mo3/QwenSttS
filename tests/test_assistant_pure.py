@@ -464,24 +464,101 @@ class TestContinuousConversation:
         assert wait_for(lambda: a.state == AssistantState.IDLE, timeout=4.0)
 
 
-class TestThresholdParameter:
-    """X6 回归：阈值必须是真实参数，不能是「看着生效」的空操作。"""
+class TestOpenFailureDoesNotPoisonTheInstance:
+    """M4 审查 R2。
 
-    def test_threshold_is_a_constructor_argument(self):
+    原先 self._running = True 与 microphone.open() 都在 try 之外：
+    open() 一抛，finally（_running=False / speaker.stop() / microphone.close() /
+    转 EXITING）整段跳过，_running 永远停在 True。
+
+    根因是 M3 留下的，但**「永久不可复用」这个硬失败是 M4 引入的** ——
+    M4 给 run() 加了并发守卫，于是第二次 run() 会抛一句
+    「助手已经在运行中」，而真实原因是麦克风被占用。用户拿到的
+    是一条与病因无关的报错。
+    """
+
+    def test_running_flag_is_rolled_back(self):
+        a, _ = make_assistant()
+        def boom():
+            from app.core.errors import AudioDeviceError
+            raise AudioDeviceError("无法打开麦克风", hint="设备被占用")
+        a.microphone.open = boom
+
+        with pytest.raises(Exception):
+            a.run()
+
+        assert a._running is False, "open() 失败后 _running 必须回滚，否则实例永久不可用"
+
+    def test_the_instance_can_be_retried_after_a_failed_open(self):
+        """最要紧的一条：失败之后还能再试一次，而不是永远说「已经在运行中」。"""
+        a, _ = make_assistant()
+        from app.core.errors import AudioDeviceError
+
+        calls = {"n": 0}
+        def flaky_open():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise AudioDeviceError("无法打开麦克风", hint="设备被占用")
+        a.microphone.open = flaky_open
+
+        with pytest.raises(Exception):
+            a.run()
+        assert calls["n"] == 1
+
+        # 第二次必须能真的跑起来，而不是撞在并发守卫上
+        thread = start(a)
+        assert wait_for(lambda: a._running, timeout=3.0), (
+            "麦克风恢复之后应当能重新开会话"
+        )
+        a.stop()
+        thread.join(timeout=5.0)
+
+
+class TestThresholdParameter:
+    """X6 回归：阈值必须是真实参数，不能是「看着生效」的空操作。
+
+    这条测试原先会构造**真实**的 WakeWordDetector，于是需要约 31MB 的
+    唤醒模型 —— 而模型不入库（.gitignore 里 `models/*`，只保留 keywords）。
+    结果是**干净克隆上跑 pytest 会挂 2 条**（M4 自查 A1），
+    而 tests/README.md 写着「不需要任何硬件、网络或密钥，随时可跑」。
+
+    改成注入替身之后，不但不再依赖模型，断言还更强了：
+    原先只验证「读回来的值等于传进去的值」，现在验证
+    「这个值确实被送进了检测器的构造参数」—— 后者才是 X6 真正要防的东西
+    （空操作会通过前者，但过不了后者）。
+    """
+
+    @pytest.fixture
+    def fake_detector(self, monkeypatch):
+        captured: dict = {}
+
+        class FakeDetector:
+            def __init__(self, cfg=None):
+                captured["cfg"] = cfg
+                self.cfg = cfg
+
+        monkeypatch.setattr("app.perception.wakeword.WakeWordDetector", FakeDetector)
+        return captured
+
+    def test_threshold_is_a_constructor_argument(self, fake_detector):
         a = VoiceAssistant(Config.load({}), wake_threshold=0.15)
         try:
             assert a.wake_threshold == 0.15, (
                 f"构造时传入的阈值应当生效，实际 {a.wake_threshold}"
             )
+            assert fake_detector["cfg"].threshold == 0.15, (
+                "阈值必须真的进到检测器的构造参数里 —— 只存在属性上就是空操作"
+            )
         finally:
             a.close()
 
-    def test_none_uses_default(self):
+    def test_none_uses_default(self, fake_detector):
         from app.perception.wakeword import DEFAULT_THRESHOLD
 
         a = VoiceAssistant(Config.load({}))
         try:
             assert a.wake_threshold == DEFAULT_THRESHOLD
+            assert fake_detector["cfg"].threshold == DEFAULT_THRESHOLD
         finally:
             a.close()
 

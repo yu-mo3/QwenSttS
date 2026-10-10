@@ -196,6 +196,24 @@ class EventBridge(QObject):
         self.level_changed.emit(float(level), source)
 
 
+#: 只进技术面板原始日志、**没有专门信号**的事件。
+#:
+#: 显式列出来而不是随手放过：新增一个事件时，要么给它接一个专门信号，
+#: 要么在这里写清楚为什么不接 —— 二者必居其一。
+#:
+#: 这是一条 M4 审查 R4 逼出来的约束。原先那条「覆盖每个订阅事件」的测试
+#: 断言只是 `assert handled`（非空），删掉 9 个映射里的 8 个照样绿 ——
+#: 名字承诺的是覆盖度，实际给的是虚假信心。
+LOG_ONLY_EVENTS = frozenset(
+    {
+        EVT_WAKE,            # 唤醒已由 state 事件表达（待机 -> 聆听）
+        EVT_SPEECH_START,    # 界面只在事件日志里看它，没有专门行为
+        EVT_SPEECH_END,      # 同上；时长只在日志里有意义
+        EVT_PLAYBACK_START,  # 逐句播放的进度由 tts_done 的 index/total 表达
+        EVT_PLAYBACK_DONE,   # 同上
+    }
+)
+
 #: 界面「技术面板的事件日志」关心的事件名 —— 全部。
 #: 显式列出来是为了让「我们到底订阅了什么」这件事有个唯一答案。
 SUBSCRIBED_EVENTS = frozenset(
