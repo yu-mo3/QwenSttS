@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -96,3 +98,81 @@ class TestSpeakerBeep:
             speaker.beep(duration=duration)
             # 极短时长允许不发声（返回空），但绝不能抛异常
             assert len(audio) <= 1
+
+def _devicefree_speaker(blocks: int = 4, stop_at: int | None = None):
+    """造一个不碰硬件的 Speaker。
+
+    用 __new__ 绕过 __init__（不解析真实音频设备），补上 play() 需要的
+    运行时字段，再替换 _play_loop 成分块假播放。返回 (扬声器, 已播块号)。
+
+    stop_at 指定在第几块之后调用 stop()，用来模拟「播放途中用户喊停」。
+    """
+    speaker = Speaker.__new__(Speaker)
+    speaker.settings = AudioSettings()
+    speaker._stop_event = threading.Event()
+    speaker._playing = threading.Event()
+    speaker._lock = threading.Lock()
+    played: list[int] = []
+
+    def fake_play_loop(pcm, rate, channels) -> None:
+        for index in range(blocks):
+            if speaker._stop_event.is_set():
+                return
+            played.append(index)
+            if stop_at is not None and index == stop_at:
+                speaker.stop()
+
+    speaker._play_loop = fake_play_loop  # type: ignore[method-assign]
+    return speaker, played
+
+
+class TestSpeakerStopLatch:
+    """KI-007②：句间窗口发出的「停」不能被静默丢掉。
+
+    修复前 stop() 只在 _playing 已置位时才置位停止事件，而 play() 入口
+    又会 clear() 它 —— 于是「上一句刚播完、下一句还没开始」那一小段窗口里
+    发出的停止请求会被丢掉：用户喊了「停」，她 200ms 后接着念下一句。
+    """
+
+    def test_stop_before_play_skips_the_utterance(self) -> None:
+        speaker, played = _devicefree_speaker()
+        speaker.stop()          # 句间窗口发出的停止请求
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert played == [], "一个字都不该播"
+        assert speaker.is_playing is False, "跳过时不该留下播放中的状态"
+
+    def test_latch_is_consumed_by_the_next_play(self) -> None:
+        """闭锁只作用于当前这一段，不能把后续每一次播放都吃掉。"""
+        speaker, played = _devicefree_speaker()
+        speaker.stop()
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played, "第二段应当正常播放"
+
+    def test_clear_stop_reenables_playback(self) -> None:
+        speaker, played = _devicefree_speaker()
+        speaker.stop()
+        speaker.clear_stop()    # 新一段播报 / 新会话开始
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played
+
+    def test_stop_during_playback_still_interrupts(self) -> None:
+        speaker, played = _devicefree_speaker(blocks=4, stop_at=1)
+        assert speaker.play(b"\x01\x02" * 100) is False
+        assert played == [0, 1], f"应当在第 2 块后停下，实际播了 {played}"
+
+    def test_full_playback_returns_true(self) -> None:
+        speaker, played = _devicefree_speaker(blocks=3)
+        assert speaker.play(b"\x01\x02" * 100) is True
+        assert played == [0, 1, 2]
+
+    def test_empty_audio_is_a_noop_success(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        assert speaker.play(b"") is True
+
+    def test_stop_latches_when_idle(self) -> None:
+        """空闲时也要置位 —— 这正是修复点。"""
+        speaker, _ = _devicefree_speaker()
+        assert speaker._stop_event.is_set() is False
+        speaker.stop()
+        assert speaker._stop_event.is_set() is True

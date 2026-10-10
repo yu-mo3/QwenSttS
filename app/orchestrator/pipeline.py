@@ -20,8 +20,6 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
 
 from app.audio.capture import Microphone
@@ -32,44 +30,40 @@ from app.capabilities.tts import SpeechSynthesizer
 from app.config import Config
 from app.core.errors import ApiError, AyuanError
 from app.core.logger import get_logger
+from app.orchestrator.events import (
+    EVT_ASR_DONE,
+    EVT_ERROR,
+    EVT_LLM_DONE,
+    EVT_PLAYBACK_DONE,
+    EVT_PLAYBACK_START,
+    EVT_RECORDING_DONE,
+    EVT_RECORDING_START,
+    EVT_RETRY,
+    EVT_TTS_DONE,
+    EventCallback,
+    TurnResult,
+)
 
 log = get_logger(__name__)
 
-# 事件名常量 —— 用常量而不是字面量，避免订阅方拼错字符串
-EVT_RECORDING_START = "recording_start"
-EVT_RECORDING_DONE = "recording_done"
-EVT_ASR_DONE = "asr_done"
-EVT_LLM_DONE = "llm_done"
-EVT_TTS_DONE = "tts_done"
-EVT_PLAYBACK_START = "playback_start"
-EVT_PLAYBACK_DONE = "playback_done"
-EVT_RETRY = "retry"
-EVT_ERROR = "error"
-
-EventCallback = Callable[[str, dict[str, Any]], None]
-
-
-@dataclass
-class TurnResult:
-    """一轮对话的完整结果与耗时。"""
-
-    user_text: str = ""
-    reply_text: str = ""
-    sentences: list[str] = field(default_factory=list)
-    emotion: str = ""
-    timings: dict[str, float] = field(default_factory=dict)
-    audio_seconds: float = 0.0
-    failed: bool = False
-    error: str = ""
-
-    def timing_summary(self) -> str:
-        if not self.timings:
-            return ""
-        order = ["识别", "对话", "合成", "播放"]
-        parts = [f"{k} {self.timings[k]:.2f}s" for k in order if k in self.timings]
-        total = sum(self.timings.values())
-        parts.append(f"合计 {total:.2f}s")
-        return " · ".join(parts)
+# 事件名 / EventCallback / TurnResult 都住在 events.py —— 与 assistant 共用
+# 同一份契约（M4 修 KI-006）。这里 import 进来【再导出】，是为了让
+#   from app.orchestrator.pipeline import EVT_XXX / TurnResult
+# 这种既有用法继续有效（tests/ 与 tools/ 都在用，不改它们就少一次回归风险）。
+__all__ = [
+    "VoicePipeline",
+    "TurnResult",
+    "EventCallback",
+    "EVT_RECORDING_START",
+    "EVT_RECORDING_DONE",
+    "EVT_ASR_DONE",
+    "EVT_LLM_DONE",
+    "EVT_TTS_DONE",
+    "EVT_PLAYBACK_START",
+    "EVT_PLAYBACK_DONE",
+    "EVT_RETRY",
+    "EVT_ERROR",
+]
 
 
 class VoicePipeline:
@@ -175,6 +169,10 @@ class VoicePipeline:
         play_time = 0.0
         total_audio = 0.0
         played = 0
+
+        # 一段播报 = 一个停止闭锁的作用域：开始前先清掉上一轮遗留的停止请求，
+        # 否则「上次点的停」会把这次的第一句吃掉（KI-007②）
+        self.speaker.clear_stop()
 
         for index, sentence in enumerate(sentences, 1):
             started = time.monotonic()

@@ -34,7 +34,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -46,27 +46,32 @@ from app.capabilities.tts import SpeechSynthesizer
 from app.config import Config
 from app.core.errors import ApiError, AyuanError
 from app.core.logger import get_logger
+from app.orchestrator.events import (
+    EVT_ASR_DONE,
+    EVT_ERROR,
+    EVT_EXIT,
+    EVT_IDLE_TIMEOUT,
+    EVT_INTERRUPTED,
+    EVT_LLM_DONE,
+    EVT_PLAYBACK_DONE,
+    EVT_PLAYBACK_START,
+    EVT_RETRY,
+    EVT_SPEECH_END,
+    EVT_SPEECH_START,
+    EVT_STATE,
+    EVT_TTS_DONE,
+    EVT_WAKE,
+    EventCallback,
+    TurnResult,
+)
 from app.orchestrator.states import AssistantState, InvalidTransition, can_transition
 
 log = get_logger(__name__)
 
-# ── 事件名 ──
-EVT_STATE = "state"
-EVT_WAKE = "wake"
-EVT_SPEECH_START = "speech_start"
-EVT_SPEECH_END = "speech_end"
-EVT_ASR_DONE = "asr_done"
-EVT_LLM_DONE = "llm_done"
-EVT_TTS_DONE = "tts_done"
-EVT_PLAYBACK_START = "playback_start"
-EVT_PLAYBACK_DONE = "playback_done"
-EVT_INTERRUPTED = "interrupted"
-EVT_RETRY = "retry"
-EVT_IDLE_TIMEOUT = "idle_timeout"
-EVT_ERROR = "error"
-EVT_EXIT = "exit"
-
-EventCallback = Callable[[str, dict[str, Any]], None]
+# 事件名 / EventCallback / TurnResult 都住在 events.py —— 与 pipeline 共用同一份
+# 契约（M4 修 KI-006）。这里 import 进来【再导出】，既有的
+#   from app.orchestrator.assistant import EVT_STATE
+# 用法（tools/m3_assistant.py 就在用）保持不变。
 
 # 说这些词结束连续对话
 BYE_WORDS = ("再见", "拜拜", "退下", "结束", "不用了", "退出")
@@ -96,25 +101,6 @@ class SessionStats:
         )
 
 
-@dataclass
-class TurnResult:
-    """一轮对话的结果。"""
-
-    user_text: str = ""
-    reply_text: str = ""
-    audio_seconds: float = 0.0
-    played: int = 0
-    interrupted: bool = False
-    failed: bool = False
-    error: str = ""
-    timings: dict[str, float] = field(default_factory=dict)
-
-    def timing_summary(self) -> str:
-        order = ["识别", "对话", "播报"]
-        parts = [f"{k} {self.timings[k]:.2f}s" for k in order if k in self.timings]
-        if parts:
-            parts.append(f"合计 {sum(self.timings.values()):.2f}s")
-        return " · ".join(parts)
 
 
 class _SentenceSpeaker:
@@ -130,11 +116,24 @@ class _SentenceSpeaker:
     def __init__(self, tts: SpeechSynthesizer, speaker: Speaker, emit: EventCallback) -> None:
         self.tts = tts
         self.speaker = speaker
+        # emit 的签名就是 EventCallback(事件名, 载荷字典)。
+        # 原先这里传的是 VoiceAssistant._emit(事件名, **载荷)，声明与调用对不上，
+        # 属于「类型撒谎」—— 正是 KI-006 那一类问题的温床。
+        # 现在由 VoiceAssistant._event_sink 适配成标准签名。
         self._emit = emit
 
-    def run(self, sentences: Iterator[str]) -> tuple[float, int, bool]:
-        """返回 (音频总时长, 成功播放句数, 是否被打断)。"""
-        had_sentences = False   # 迭代器消费后就空了，先记下来
+    def run(self, sentences: Sequence[str]) -> tuple[float, int, bool]:
+        """返回 (音频总时长, 成功播放句数, 是否被打断)。
+
+        入参是 Sequence 而不是 Iterator：需要 len() 来给 tts_done 事件带上
+        total（KI-006 —— 界面靠它显示「第 i / N 句」，pipeline 一直有、
+        assistant 原先漏了，统一订阅时就是必现的 KeyError）。
+        """
+        total = len(sentences)
+        # 一段播报 = 一个停止闭锁的作用域：开始前清掉上一轮遗留的停止请求，
+        # 否则「上次点的停」会把这次的第一句吃掉（KI-007②）
+        self.speaker.clear_stop()
+        had_sentences = False   # 空列表也是一种「没有句子」，先记下来
         pending: queue.Queue = queue.Queue()
         ready: queue.Queue = queue.Queue()
         stop = threading.Event()
@@ -189,16 +188,16 @@ class _SentenceSpeaker:
 
             total_audio += result.duration
             played += 1
-            self._emit(EVT_TTS_DONE, index=index, duration=result.duration)
-            self._emit(EVT_PLAYBACK_START, index=index)
+            self._emit(EVT_TTS_DONE, {"index": index, "total": total, "duration": result.duration})
+            self._emit(EVT_PLAYBACK_START, {"index": index})
 
             completed = self.speaker.play(result.audio)
-            self._emit(EVT_PLAYBACK_DONE, index=index, completed=completed)
+            self._emit(EVT_PLAYBACK_DONE, {"index": index, "completed": completed})
 
             if not completed:
                 interrupted = True
                 stop.set()
-                self._emit(EVT_INTERRUPTED)
+                self._emit(EVT_INTERRUPTED, {})
                 break
 
         stop.set()
@@ -344,6 +343,15 @@ class VoiceAssistant:
         except Exception as exc:  # 订阅方出错不该拖垮主流程
             log.warning("事件回调 %s 抛错：%s", event, exc)
 
+    def _event_sink(self, event: str, payload: dict[str, Any]) -> None:
+        """把标准 EventCallback 签名适配到内部的 _emit(事件名, **载荷)。
+
+        内部保留 **载荷 的写法是因为绝大多数调用点只关心三两个键，
+        key=value 比手写字面量字典好读；对外（_SentenceSpeaker）则统一走
+        标准签名，避免同一个项目里出现两种事件回调约定。
+        """
+        self._emit(event, **payload)
+
     def _on_retry(self, attempt: int, total: int, reason: str) -> None:
         self._emit(EVT_RETRY, attempt=attempt, total=total, reason=reason)
 
@@ -351,6 +359,28 @@ class VoiceAssistant:
         """请求退出。可以从其他线程调用。"""
         self._running = False
         self.speaker.stop()
+
+    def _begin_new_session(self) -> None:
+        """把会话级状态归位，为一次新的 run() 做准备（KI-007①）。
+
+        刻意**绕过转换表**：EXITING -> IDLE 在同一会话内确实是非法转换
+        （转换表因此拒绝它），但「上一个会话已结束，现在开一个新的」
+        是合法的重置语义。写成一个具名方法而不是散在 run() 里，
+        是为了让「这里故意绕过了状态机」这件事一眼可见、且只有一处。
+
+        对话记忆**不清空** —— 关掉界面再打开，她应该还记得刚才聊了什么。
+        """
+        if self.state is AssistantState.EXITING:
+            log.info("上一个会话已结束，开始新会话")
+        self.state = AssistantState.IDLE
+        self.stats = SessionStats()
+        self._last_activity = time.monotonic()
+        # 清掉上一轮遗留的停止闭锁，否则新会话的第一句会被静默吃掉
+        self.speaker.clear_stop()
+        # 队列里可能还压着上一个会话的音频帧，带进新会话会让它「听到」旧声音
+        self._drain_frames()
+        if self._segmenter is not None:
+            self._segmenter.reset()
 
     # ══════════════════════════════════════════════════════
     #  输入线程
@@ -397,7 +427,24 @@ class VoiceAssistant:
     # ══════════════════════════════════════════════════════
 
     def run(self, *, max_turns: int | None = None) -> SessionStats:
-        """启动助手，直到收到退出指令。"""
+        """启动助手，直到收到退出指令。
+
+        **可重入**（M4 修 KI-007①）：EXITING 是会话内的终态，但再次调用
+        run() 的语义是「开一个新会话」，而不是非法转换。原实现直接把
+        EXITING -> IDLE 喂给 _set_state，第二次 run() 必然抛
+        InvalidTransition，且异常发生在 try 之外 —— 界面的「重新开始会话」
+        一按就拿到 traceback。
+        """
+        if self._running:
+            raise AyuanError(
+                "助手已经在运行中",
+                hint="同一个 VoiceAssistant 不能并发跑两个会话，请先 stop()",
+            )
+
+        # 会话级归位：不走转换表。EXITING -> IDLE 在**同一会话内**确实非法
+        # （所以才不在 ALLOWED_TRANSITIONS 里），但跨会话是合法的重置。
+        self._begin_new_session()
+
         self._running = True
         self._set_state(AssistantState.IDLE)
         self.microphone.open()
@@ -459,7 +506,13 @@ class VoiceAssistant:
                 self._set_state(AssistantState.LISTENING)
 
         elif state == AssistantState.LISTENING:
+            was_speaking = self.segmenter.is_speaking
             segment = self.segmenter.feed(frame)
+            if not was_speaking and self.segmenter.is_speaking:
+                # EVT_SPEECH_START 原先只定义、从不发出（死常量）。
+                # 界面要它来区分「已唤醒但还没开口」和「正在说话」——
+                # 后者才该让光球的涟漪跟着音量动。
+                self._emit(EVT_SPEECH_START)
             if segment is not None:
                 self._emit(EVT_SPEECH_END, duration=segment.duration)
                 self._run_turn(segment)
@@ -475,7 +528,8 @@ class VoiceAssistant:
 
     def _run_turn(self, segment) -> TurnResult:
         result = TurnResult()
-        started = time.monotonic()
+        # 这里【不再】记一个 started：本方法在播报线程启动后就返回，
+        # 用它算出来的「合计」天生不完整。计时一律逐项写 timings。
 
         try:
             # ---- 识别 ----
@@ -554,7 +608,10 @@ class VoiceAssistant:
             if self.state not in (AssistantState.EXITING,):
                 self._set_state(AssistantState.IDLE)
 
-        result.timings["合计"] = time.monotonic() - started
+        # 【刻意不存 timings["合计"]】
+        # _run_turn 在播报线程启动后就返回了，此刻「播报」这一项还没写完；
+        # 存下来的合计既漏掉播报，又会在 timing_summary() 求和时被再加一遍
+        # —— 与 M2 审查 B2 是同一类矛盾。合计一律由 timing_summary() 现算。
         return result
 
     def _start_speaking(self, sentences: list[str], result: TurnResult) -> None:
@@ -577,9 +634,10 @@ class VoiceAssistant:
         self._speak_started = time.monotonic()
 
         def work() -> None:
-            speaker = _SentenceSpeaker(self.tts, self.speaker, self._emit)
+            speaker = _SentenceSpeaker(self.tts, self.speaker, self._event_sink)
             try:
-                box["result"] = speaker.run(iter(sentences))
+                # 传快照：run() 现在需要 len() 才能发出 tts_done 的 total
+                box["result"] = speaker.run(list(sentences))
             except BaseException as exc:  # noqa: BLE001 — 交给主线程统一处理
                 box["error"] = exc
 

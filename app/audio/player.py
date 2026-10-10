@@ -85,10 +85,39 @@ class Speaker:
         return self._playing.is_set()
 
     def stop(self) -> None:
-        """请求停止播放。会在下一个音频块边界生效（约 20ms 内）。"""
-        if self._playing.is_set():
-            self._stop_event.set()
-            log.debug("收到停止播放请求")
+        """请求停止播放。会在下一个音频块边界生效（约 20ms 内）。
+
+        **无条件闭锁**（M4 修 KI-007②）：原先只在 `_playing` 已置位时才
+        置位停止事件，而 `play()` 又会在入口 `clear()` 它 —— 于是
+        「上一句刚播完、下一句还没开始」的那一小段窗口里发出的停止请求
+        会被静默丢掉。用户喊了「停」，她却在 200ms 后接着念下一句。
+
+        现在置位后一直有效，直到被 `play()` 消费或被 `clear_stop()` 清除。
+        """
+        self._stop_event.set()
+        log.debug("收到停止播放请求（%s）", "播放中" if self._playing.is_set() else "空闲中·闭锁")
+
+    def clear_stop(self) -> None:
+        """清除待处理的停止请求。
+
+        调用时机：**新的一段播报开始前**、新会话开始时。
+        语义是「从现在起，之前的停止请求不再作数」——
+        没有这一步，上一次会话遗留的闭锁会把新会话的第一句吃掉。
+        """
+        if self._stop_event.is_set():
+            log.debug("清除遗留的停止请求")
+        self._stop_event.clear()
+
+    def _consume_stop(self) -> bool:
+        """读取并清除停止请求。返回「此前是否被请求过停止」。
+
+        读一次就清掉，是为了让闭锁只作用于**当前这一段**播报，
+        而不是永久性地让后续每一次播放都返回 False。
+        """
+        if self._stop_event.is_set():
+            self._stop_event.clear()
+            return True
+        return False
 
     # ---------- 播放 ----------
 
@@ -107,11 +136,16 @@ class Speaker:
             return True
 
         with self._lock:
-            self._stop_event.clear()
+            # 入口先消费闭锁：句间窗口发出的 stop 必须在**这一句**生效，
+            # 而不是被 clear() 吞掉后当作什么都没发生
+            if self._consume_stop():
+                log.info("播放前已收到停止请求，跳过本次播放")
+                return False
+
             self._playing.set()
             try:
                 self._play_loop(pcm, rate, channels)
-                return not self._stop_event.is_set()
+                return not self._consume_stop()
             finally:
                 self._playing.clear()
 
