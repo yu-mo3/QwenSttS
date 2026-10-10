@@ -314,6 +314,124 @@ class TestSegmenterLogic:
         assert abs(produced[0].duration - expected) < 1e-6
 
 
+# ══════════════════════════════════════════════════════
+#  分段器 · 帧序列完整性（X3 回归）
+# ══════════════════════════════════════════════════════
+
+def numbered_frame(index: int) -> bytes:
+    """生成内容可识别的帧：640 字节全是这个序号（16bit 小端）。
+
+    为什么需要它：原先的测试桩帧内容全是 b"\x00" * 640，
+    于是「同一帧被拼进语音段两次」这种 bug **物理上不可能被发现** ——
+    重复 100 遍也和一遍长得一样。带序号之后一眼就能看出来。
+    """
+    return index.to_bytes(2, "little") * 320
+
+
+def frame_indices(pcm: bytes) -> list[int]:
+    """把语音段的 PCM 还原成帧序号序列。"""
+    return [
+        int.from_bytes(pcm[i : i + 2], "little")
+        for i in range(0, len(pcm) - 1, FRAME_BYTES)
+    ]
+
+
+class TestSegmenterNoDuplication:
+    """X3 回归：语音段里不能出现重复帧。
+
+    真实症状：送进 ASR 的开头被念两遍（"你你你好"）。
+    根因曾经是——确认说话前，同一帧同时进了 collected 与前导缓冲，
+    确认时又做 collected = pre_buffer + collected。
+    """
+
+    def _run(self, pattern, **kw):
+        seg = SpeechSegmenter(StubVad(pattern), **kw)
+        produced = []
+        for i in range(len(pattern)):
+            s = seg.feed(numbered_frame(i))
+            if s:
+                produced.append(s)
+        tail = seg.flush()
+        if tail:
+            produced.append(tail)
+        return produced
+
+    def test_no_duplicate_frames_at_head(self):
+        """开头不能重复。"""
+        pattern = [False] * 20 + [True] * 40 + [False] * 40
+        produced = self._run(pattern)
+        assert len(produced) == 1
+        idx = frame_indices(produced[0].pcm)
+        assert len(idx) == len(set(idx)), (
+            f"语音段内有重复帧：{sorted(i for i in set(idx) if idx.count(i) > 1)}"
+        )
+
+    def test_frame_sequence_is_monotonic(self):
+        """帧序号必须单调递增 —— 既不能重复，也不能乱序。"""
+        pattern = [False] * 20 + [True] * 40 + [False] * 40
+        produced = self._run(pattern)
+        idx = frame_indices(produced[0].pcm)
+        assert idx == sorted(idx), f"帧序不是递增的：{idx}"
+
+    def test_head_keeps_every_speech_frame(self):
+        """说话的第一个字不能被丢掉 —— 这是前导缓冲存在的理由。"""
+        pattern = [False] * 20 + [True] * 40 + [False] * 40
+        produced = self._run(pattern, pre_buffer=10, speech_window=10)
+        idx = frame_indices(produced[0].pcm)
+        speech = [i for i in idx if 20 <= i <= 59]
+        assert speech == list(range(20, 60)), (
+            f"人声帧应完整且有序，实际缺 {sorted(set(range(20,60)) - set(speech))}"
+        )
+        # 组合是「40 帧人声 + 后导缓冲的 10 帧静音」。
+        # 注意 pre_buffer == speech_window 时，确认瞬间缓冲里已经全是
+        # 人声帧了（确认需要 10 帧人声），所以不会额外带出更早的静音。
+        assert len(idx) == 40 + 10, f"应为 40 人声 + 10 后导静音，实际 {len(idx)}"
+
+    def test_larger_pre_buffer_also_captures_leading_silence(self):
+        """前导缓冲大于确认窗口时，才会额外保留说话前的静音。"""
+        pattern = [False] * 20 + [True] * 40 + [False] * 40
+        produced = self._run(pattern, pre_buffer=20, speech_window=10)
+        idx = frame_indices(produced[0].pcm)
+        # 缓冲 20 帧 > 窗口 10 帧，取到序号 10..29，因此含 10..19 的静音
+        assert min(idx) == 10, f"应当带出更早的静音帧，实际起点 {min(idx)}"
+        assert len(idx) == len(set(idx)), "仍不能有重复"
+
+    def test_tail_contains_bounded_post_buffer(self):
+        """尾部静音只保留后导缓冲那么多，不是整个静音窗口。"""
+        pattern = [True] * 40 + [False] * 40
+        produced = self._run(pattern, post_buffer=10, silence_window=30)
+        idx = frame_indices(produced[0].pcm)
+        tail = [i for i in idx if i >= 40]
+        assert len(tail) == 10, f"尾部静音应只保留 10 帧，实际 {len(tail)}"
+        assert tail == sorted(tail) and len(tail) == len(set(tail))
+
+    def test_two_segments_both_clean(self):
+        """切成两段时，每段自身都不能有重复。"""
+        pattern = [True] * 40 + [False] * 40 + [True] * 40 + [False] * 40
+        produced = self._run(pattern)
+        assert len(produced) == 2
+        for k, seg in enumerate(produced):
+            idx = frame_indices(seg.pcm)
+            assert len(idx) == len(set(idx)), f"第 {k+1} 段有重复帧"
+
+    def test_full_sequence_partition(self):
+        """两段合起来不应遗漏人声帧（可以重叠缓冲，但不能丢人声）。"""
+        pattern = [True] * 40 + [False] * 40 + [True] * 40 + [False] * 40
+        produced = self._run(pattern)
+        all_idx = [i for seg in produced for i in frame_indices(seg.pcm)]
+        speech = [i for i in all_idx if i < 40 or (80 <= i < 120)]
+        assert len(speech) == len(set(speech)), "人声帧不应被重复收集"
+        for i in range(40):
+            assert i in speech, f"第 1 段丢了人声帧 {i}"
+        for i in range(80, 120):
+            assert i in speech, f"第 2 段丢了人声帧 {i}"
+
+    def test_rejects_pre_buffer_smaller_than_window(self):
+        """前导缓冲小于确认窗口会丢首字，应当拒绝构造。"""
+        with pytest.raises(ValueError, match="pre_buffer"):
+            SpeechSegmenter(StubVad([True]), pre_buffer=5, speech_window=10)
+
+
 class TestSegmenterWithRealVad:
     """分段器 + 真实 VAD 的集成：验证两者能配合，不验证信号特征。"""
 

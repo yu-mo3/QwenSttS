@@ -86,6 +86,14 @@ class SpeechSegmenter:
         # 参数自洽校验：最长时长若短于最短时长，语音段永远无法产出，
         # 而且失败得毫无痕迹（_finish 会把每段都当"过短"丢掉）。
         # 这个组合是在写测试时才意识到的，与其让它静默失效，不如拒绝构造。
+        if pre_buffer < speech_window:
+            # 确认说话前，帧只存在前导缓冲里。若它比确认窗口还小，
+            # 确认时就会丢掉最早的那几帧 —— 也就是用户说的第一个字。
+            raise ValueError(
+                f"pre_buffer({pre_buffer}) 必须 >= speech_window({speech_window})，"
+                "否则说话开头会被丢掉"
+            )
+
         if max_speech_ms <= min_speech_ms:
             raise ValueError(
                 f"max_speech_ms({max_speech_ms}) 必须大于 min_speech_ms({min_speech_ms})，"
@@ -117,42 +125,47 @@ class SpeechSegmenter:
         decision = self.vad.decide(frame)
         state = self._state
 
+        # 帧的归属必须互斥，否则会在语音段首尾产生重复：
+        #   · 未确认说话   -> 只进前导缓冲（pre_buffer）
+        #   · 确认瞬间     -> 一次性接管整个前导缓冲作为开头
+        #   · 说话中的人声 -> 追加进 collected
+        #   · 说话中的静音 -> 只进后导缓冲（post_buffer），结束时才接上
+        #
+        # 早先的写法把「确认前的人声帧」同时放进 collected 与前导缓冲，
+        # 确认时又做 collected = pre_buffer + collected，导致开头 180ms
+        # 被念两遍。尾部同理。当时的测试桩帧内容全同，物理上看不出来。
         if decision.is_speech:
             state.speech_count += 1
             state.silence_count = 0
             state.post_buffer.clear()
 
-            if not state.speaking and state.speech_count >= self.speech_window:
-                state.speaking = True
-                # 关键：把前导缓冲接在正式内容之前，否则首字被吃掉
-                state.collected = list(state.pre_buffer) + state.collected
-                state.pre_buffer.clear()
-                log.debug("检测到说话开始（前导缓冲 %d 帧）", len(state.collected))
-
-            if state.speaking:
+            if not state.speaking:
+                self._push_pre(frame)
+                if state.speech_count >= self.speech_window:
+                    state.speaking = True
+                    state.collected = list(state.pre_buffer)
+                    state.pre_buffer.clear()
+                    state.total_frames = len(state.collected)
+                    log.debug("检测到说话开始（前导缓冲 %d 帧）", state.total_frames)
+            else:
                 state.collected.append(frame)
                 state.total_frames += 1
                 if state.total_frames >= self.max_speech_frames:
                     log.info("语音段达到上限 %.1fs，强制收尾", self.max_speech_ms / 1000)
-                    return self._finish()
-            else:
-                # 还没确认说话，但已经出现人声帧 —— 先攒着
-                state.collected.append(frame)
-                self._push_pre(frame)
+                    return self._finish(include_post=False)
         else:
             state.speech_count = 0
 
             if not state.speaking:
+                # 未确认说话时的静音：滚动更新前导缓冲，并清掉误收集的内容
                 self._push_pre(frame)
                 state.collected.clear()
                 state.total_frames = 0
             else:
                 state.silence_count += 1
-                state.collected.append(frame)
                 self._push_post(frame)
-
                 if state.silence_count >= self.silence_window:
-                    return self._finish()
+                    return self._finish(include_post=True)
 
         return None
 
@@ -170,11 +183,19 @@ class SpeechSegmenter:
 
     # ---------- 收尾 ----------
 
-    def _finish(self) -> SpeechSegment | None:
+    def _finish(self, *, include_post: bool) -> SpeechSegment | None:
+        """收尾并产出语音段。
+
+        include_post 控制是否接上后导缓冲：
+          · 自然结束（静音窗口满）时接上 —— 保住尾音
+          · 强制收尾（达到时长上限）时不接 —— 此时 post_buffer 是空的或过期
+        collected 里已经不会再混入尾部静音（静音只进 post_buffer），
+        所以这里追加不会产生重复。
+        """
         state = self._state
-        frames = state.collected
-        # 关键：接上后导缓冲，否则尾音被切掉
-        frames = frames + list(state.post_buffer)
+        frames = list(state.collected)
+        if include_post:
+            frames += list(state.post_buffer)
 
         speech_frames = state.total_frames
         self._state = _State()
@@ -202,7 +223,7 @@ class SpeechSegmenter:
     def flush(self) -> SpeechSegment | None:
         """强制收尾（用户按了停止键，或程序要退出了）。"""
         if self._state.speaking:
-            return self._finish()
+            return self._finish(include_post=True)
         self._state = _State()
         return None
 

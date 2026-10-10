@@ -16,7 +16,11 @@ r"""M3 验收脚本 · 免按钮语音对话。
 通过标准：
   1. 喊「阿源」有反应（控制台出现「唤醒」）
   2. 说完话停顿一下，她自动开始处理（不用按键）
-  3. 她用语音回答，且首句出声明显快于 M2
+  3. 从「说完」到「全部播完」的总时长明显短于 M2
+     （M2 是 N 句串行合成，N 句回复约 N x 2.4 秒纯等待；
+       M3 播放第 i 句时第 i+1 句已在合成）
+     ⚠️ 注意：**首句出声时间与 M2 相同** —— reply() 目前仍是整段生成完
+        才返回，真正「边说边播」需要把它改成生成器（见 KNOWN_ISSUES KI-001）
   4. 回答完继续说下一句，不需要再喊唤醒词
   5. 她说的时候喊「停」，她能停下来
 """
@@ -111,29 +115,30 @@ def main() -> int:
 
     head("阿源 · M3 免按钮语音对话")
     print(f"  对话模型：{config.model.llm}")
-    print(f"  唤醒阈值：{args.threshold if args.threshold is not None else 0.2}")
 
     if not config.secrets.has_dashscope:
         print("\n  ❌ 未配置 DASHSCOPE_API_KEY")
         return 1
 
-    # 唤醒阈值可临时覆盖
-    if args.threshold is not None:
-        from app import perception
-        from app.perception.wakeword import WakeWordConfig
-
-        _orig = perception.WakeWordDetector
-
-        class _Patched(_orig):  # type: ignore[misc,valid-type]
-            def __init__(self, cfg=None):
-                from app.perception.wakeword import default_config
-
-                super().__init__(cfg or default_config(threshold=args.threshold))
-
-        perception.WakeWordDetector = _Patched  # type: ignore[misc]
-
     on_event, _ = make_printer()
-    assistant = VoiceAssistant(config, on_event=on_event, idle_timeout=args.idle)
+    # 阈值作为构造参数传入。
+    # 早先是在这里 monkeypatch 包的命名空间，而 VoiceAssistant 用的是模块
+    # 命名空间的引用 —— 补丁打不上，参数看着生效实际是空操作。现在改成
+    # 真实参数，并在下面**回读实际生效值**打印出来。
+    assistant = VoiceAssistant(
+        config,
+        on_event=on_event,
+        idle_timeout=args.idle,
+        wake_threshold=args.threshold,
+    )
+
+    # 回读实际生效的阈值 —— 避免"看着生效其实没生效"
+    try:
+        threshold = assistant.wake_threshold
+        print(f"  唤醒阈值：{threshold}（实际生效值）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠️  唤醒器未就绪：{exc}")
+        return 1
 
     print()
     print("  💡 喊「阿源」唤醒；说「再见」或按 Ctrl+C 退出")

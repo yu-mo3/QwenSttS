@@ -18,9 +18,10 @@ requests>=2.32.3            # 百炼原生端点 / 天气 API
 # 加下界以免未来大版本改动流式 chunk 结构
 openai>=3.28,<4            # 百炼 OpenAI 兼容端点（LLM / VLM）
 
-# ---- L3 感知层（M3 里程碑启用，提前锁定版本）----
-# sherpa-onnx>=1.13.8       # 关键词唤醒（KWS）
-# webrtcvad-wheels>=2.0.14  # 语音活动检测（注意：包名带 -wheels，导入名仍是 webrtcvad）
+# ---- L3 感知层（M3）----
+# 注意：webrtcvad-wheels 的导入名仍是 webrtcvad
+sherpa-onnx>=1.13.8,<2      # 关键词唤醒（KWS）+ 模型文件
+webrtcvad-wheels>=2.0.14    # 语音活动检测（VAD）
 
 # ---- L6 表现层（M4 里程碑启用）----
 # PySide6>=6.8.0

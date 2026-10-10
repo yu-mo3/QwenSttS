@@ -88,11 +88,17 @@ class WakeWordConfig:
                             self.joiner(), self.keywords_file) if not p.exists()]
 
 
-def default_config(config: Config | None = None, threshold: float = DEFAULT_THRESHOLD) -> WakeWordConfig:
+def default_config(config: Config | None = None, threshold: float | None = None) -> WakeWordConfig:
+    """构造默认配置。
+
+    threshold 传 None 时用 DEFAULT_THRESHOLD —— 这样调用方可以直接把
+    "用户没指定"透传进来，不必自己兜底默认值。
+    （config 参数目前未使用，保留是为了将来支持把模型路径写进 .env。）
+    """
     return WakeWordConfig(
         model_dir=MODELS_DIR / DEFAULT_MODEL_DIR,
         keywords_file=MODELS_DIR / DEFAULT_KEYWORDS_FILE,
-        threshold=threshold,
+        threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
     )
 
 

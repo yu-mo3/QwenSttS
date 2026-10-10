@@ -174,7 +174,9 @@ def cmd_run(config: Config) -> int:
     print("       · 运行环境自检   →  python -m app.main --check")
     print("       · 查看音频设备   →  python -m app.main --devices")
     print()
-    print("     M3 将接入：离线唤醒词「阿源」· VAD 自动断句 · 随时打断。")
+    print("       · 免按钮对话     →  python tools/m3_assistant.py")
+    print()
+    print("     M4 将接入：PySide6 图形界面。")
     print()
     print("  ──────────────────────────────────────────────────")
     return 0

@@ -1,7 +1,8 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-q --strict-markers"
+# 不要在这里加 -q：命令行再传一个 -q 会叠加成 -qq，统计行会被吞掉
+addopts = "--strict-markers"
 filterwarnings = [
     # 项目自己在配置非法值时会 warn（这是刻意行为），测试里不必当噪声
     "default",
