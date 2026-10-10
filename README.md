@@ -99,6 +99,11 @@ python -m app.main              # 启动阿源
 python -m app.main --check      # 环境自检
 python -m app.main --devices    # 只看音频设备
 python -m app.main -v           # 打开调试日志
+
+# 语音对话（M2 起可用）
+python tools/m2_chat.py         # 对着麦克风说话，她会用语音回你
+python tools/m2_chat.py --text  # 纯文字模式（不录音，打字测试）
+python tools/m2_chat.py --say "你好"   # 只跑一轮，用于自动化验证
 ```
 
 ### 三种入口的分工
@@ -168,15 +173,22 @@ QwenSttS/
 │  ├─ audio/               # L2 设备层
 │  │  ├─ devices.py        #   设备枚举与按关键字选取
 │  │  ├─ capture.py        #   麦克风采集（定长 + 流式）
+│  │  ├─ wav.py            #   WAV 编解码（处理「流式 WAV 假 size」）
 │  │  └─ player.py         #   扬声器播放（可中途打断）
+│  ├─ capabilities/        # L4 能力层
+│  │  ├─ base.py           #   HTTP 客户端 / 重试 / 调用统计
+│  │  ├─ asr.py            #   语音识别（百炼原生端点）
+│  │  ├─ llm.py            #   对话（流式 + 分句 + 人设）
+│  │  └─ tts.py            #   语音合成（百炼原生端点）
+│  ├─ orchestrator/        # L5 编排层
+│  │  └─ pipeline.py       #   单轮流水线：录音→识别→对话→合成→播放
 │  ├─ perception/          # L3 感知层      （M3）
-│  ├─ capabilities/        # L4 能力层      （M2）
 │  ├─ agent/               # L4 工具池      （M5）
-│  ├─ orchestrator/        # L5 编排层      （M3）
 │  └─ ui/                  # L6 表现层      （M4）
 ├─ .vscode/                # 调试配置（团队共享，已入库）
 ├─ tools/
-│  └─ check_env.py         # M1 环境自检脚本
+│  ├─ check_env.py         # M1 环境自检脚本
+│  └─ m2_chat.py           # M2 语音对话验收脚本
 ├─ models/                 # 离线模型（不入库，运行时下载）
 ├─ data/                   # 运行产物（不入库）
 ├─ .env.example            # 密钥模板
@@ -190,12 +202,32 @@ QwenSttS/
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | **M1** | 工程骨架 · L1 基础层 · L2 设备层 · 环境自检 | ✅ 已完成 |
-| **M2** | L4 能力层：语音识别 → 对话 → 语音合成，命令行闭环 | 🚧 进行中 |
+| **M2** | L4 能力层：语音识别 → 对话 → 语音合成，命令行闭环 | ✅ 已完成 |
 | **M3** | L3 感知层 + L5 编排层：离线唤醒、VAD 断句、连续对话、打断 | ⏳ 计划中 |
 | **M4** | L6 表现层：PySide6 桌面界面 | ⏳ 计划中 |
 | **M5** | 视觉理解 + Agent 工具池 + 打包分发 | ⏳ 计划中 |
 
 ## ❓ 常见问题
+
+<details>
+<summary><b>为什么语音合成的音频时长会算成 44739 秒？</b></summary>
+
+这是踩过的一个真实深坑，值得单独记一笔。
+
+百炼 TTS 返回的是**「流式 WAV」**：它的 `RIFF` 和 `data` chunk 的 size 字段被填成 `0x7FFFFFxx`（表示「写入时大小未知」），而不是真实字节数。
+
+Python 标准库的 `wave` 模块**会照单全收**：
+
+```
+getnframes()                 ->  1073741773        (十亿量级)
+getnframes() / getframerate() ->  44739 秒          ← 时长显示成 12 小时
+readframes(getnframes())      ->  去申请 2GB 缓冲区  ← 内存炸弹
+```
+
+**对策**：`app/audio/wav.py` 是项目中唯一解析 WAV 头的地方，它**只信任 `fmt` chunk**，音频数据一律按「实际剩余字节」截断。
+
+> 教训：**永远不要相信外部数据自报的大小。**
+</details>
 
 <details>
 <summary><b>为什么不用 pyaudio 而用 sounddevice？</b></summary>
