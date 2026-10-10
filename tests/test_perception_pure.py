@@ -46,8 +46,20 @@ class TestStateMachine:
     def test_illegal_transitions_rejected(self):
         """非法转换必须被拒绝 —— 它们通常意味着并发 bug，而不是碰巧发生。"""
         assert not can_transition(AssistantState.IDLE, AssistantState.SPEAKING)
-        assert not can_transition(AssistantState.IDLE, AssistantState.THINKING)
         assert not can_transition(AssistantState.EXITING, AssistantState.IDLE)
+        assert not can_transition(AssistantState.THINKING, AssistantState.LISTENING)
+        assert not can_transition(AssistantState.SPEAKING, AssistantState.THINKING)
+
+    def test_idle_to_thinking_is_legal_for_typed_input(self):
+        """M4：打字输入不经过唤醒与聆听，所以待机 -> 思考成了合法转换。
+
+        这条断言是**刻意改的**，不是把测试改成迁就代码。原断言
+        （not can_transition(IDLE, THINKING)）在只有语音入口时成立，
+        但它锁的是实现现状而不是规则。现在多了一条真实存在的入口，
+        规则就该跟着更新 —— 而「待机 -> 说话」依旧非法：
+        没有思考就没有话可说。
+        """
+        assert can_transition(AssistantState.IDLE, AssistantState.THINKING)
 
     def test_any_state_can_exit(self):
         for state in AssistantState:

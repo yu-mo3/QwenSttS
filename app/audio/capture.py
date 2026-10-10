@@ -21,6 +21,7 @@ import numpy as np
 import sounddevice as sd
 
 from app.audio.devices import resolve_device, resolve_name
+from app.audio.wav import pcm_rms
 from app.config import AudioSettings
 from app.core.errors import AudioDeviceError
 from app.core.logger import get_logger
@@ -258,8 +259,9 @@ class Microphone:
         """均方根振幅（0~1）。静音约 0.000x，正常说话约 0.02~0.15。
 
         对任意字节长度都安全（空、奇数长度均返回 0 或截断后的值）。
+
+        实现委托给 wav.pcm_rms —— 扬声器侧驱动电平波形时要用同一份，
+        各写一份迟早会在「奇数字节怎么办」上分叉。这里保留类方法是为了
+        不改动 tools/ 与 tests/ 里既有的 Microphone.rms(...) 用法。
         """
-        samples = cls._to_samples(pcm).astype(np.float32)
-        if samples.size == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(samples**2)) / 32768.0)
+        return pcm_rms(pcm)

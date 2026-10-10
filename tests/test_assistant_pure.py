@@ -187,8 +187,10 @@ class FakeSegmenter:
 class FakeAsr:
     def __init__(self, text: str = "你好") -> None:
         self.text = text
+        self.calls = 0      # 打字输入必须让这个计数保持 0
 
     def transcribe(self, pcm, rate, **kw):
+        self.calls += 1
         class T:
             pass
 
@@ -647,4 +649,155 @@ class TestSpeechStartEvent:
 
         assert wait_for(lambda: "speech_end" in events, timeout=5.0)
         assert events.index("speech_start") < events.index("speech_end")
+
+
+# ══════════════════════════════════════════════════════
+#  M4：表现层下达的指令
+# ══════════════════════════════════════════════════════
+
+class NeverWake:
+    """从不唤醒 —— 用来验证「点击说话」这条不依赖唤醒词的入口。
+
+    唤醒词只认真人语音、无法用 TTS 闭环自测（见 status.md 第六节），
+    所以界面必须有一条确定性的兜底入口，而它必须能在唤醒器完全失灵时工作。
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def feed(self, frame) -> bool:
+        self.count += 1
+        return False
+
+    def reset(self) -> None:
+        pass
+
+
+class TestControlCommands:
+    """指令走队列而不是直接调方法：GUI 线程不能碰主循环独占的状态字段。"""
+
+    def test_listen_command_bypasses_the_wake_word(self, stop_after):
+        a = stop_after(make_assistant(wake=NeverWake(), stop=FakeStop(hits=False))[0])
+        seen: list[str] = []
+        a.on_event = lambda e, p: seen.append(e)
+        start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        a.post("listen")
+
+        assert wait_for(lambda: "speech_end" in seen, timeout=5.0), (
+            f"点击说话应当能走完一轮，实际事件：{seen}"
+        )
+        assert "wake" not in seen, "这条路径不该经过唤醒词"
+
+    def test_typed_text_runs_a_full_turn(self, stop_after):
+        a = stop_after(make_assistant(wake=NeverWake(), stop=FakeStop(hits=False))[0])
+        events: list[tuple[str, dict]] = []
+        a.on_event = lambda e, p: events.append((e, p))
+        start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        assert a.submit_text("你好呀") is True
+
+        assert wait_for(
+            lambda: any(e == "llm_done" for e, _ in events), timeout=5.0
+        ), f"打字应当走完一整轮，实际事件：{[e for e, _ in events]}"
+
+        asr = [p for e, p in events if e == "asr_done"]
+        assert asr, "打字输入也应当发 asr_done（下游共用同一条路径）"
+        assert asr[0]["text"] == "你好呀"
+        assert asr[0]["source"] == "typed", "事件日志里必须看得出这是打字不是说话"
+        assert a.tts.calls > 0, "打字同样应当合成语音"
+
+    def test_typed_text_does_not_call_asr(self, stop_after):
+        a = stop_after(make_assistant(wake=NeverWake(), stop=FakeStop(hits=False))[0])
+        events: list[str] = []
+        a.on_event = lambda e, p: events.append(e)
+        start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        a.submit_text("你好")
+        assert wait_for(lambda: "llm_done" in events, timeout=5.0)
+        assert a.asr.calls == 0, "打字输入不该调用语音识别"
+
+    def test_typed_text_can_end_the_session(self, stop_after):
+        a = stop_after(make_assistant(wake=NeverWake(), stop=FakeStop(hits=False))[0])
+        thread = start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        a.submit_text("再见")
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "打字说再见同样应当结束会话（两条入口不能分叉）"
+
+    def test_empty_text_is_not_accepted(self):
+        a, _ = make_assistant()
+        assert a.submit_text("") is False
+        assert a.submit_text("   ") is False
+        assert a.submit_text(None) is False  # type: ignore[arg-type]
+
+    def test_unknown_command_does_not_kill_the_session(self, stop_after):
+        a = stop_after(make_assistant(stop=FakeStop(hits=False))[0])
+        start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        a.post("这条指令不存在")
+        time.sleep(0.4)
+
+        assert a._running, "一条坏指令不该让整个会话停摆"
+
+    def test_shutdown_command_ends_the_session(self, stop_after):
+        a = stop_after(make_assistant(stop=FakeStop(hits=False))[0])
+        thread = start(a)
+        assert wait_for(lambda: a._running, timeout=3.0)
+
+        a.post("shutdown")
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    def test_stop_speaking_command_is_delivered(self, stop_after):
+        a = stop_after(make_assistant(stop=FakeStop(hits=False))[0])
+        start(a)
+        assert wait_for(lambda: a.speaker.play_calls > 0, timeout=5.0)
+
+        a.post("stop_speaking")
+        assert wait_for(lambda: a.speaker.stop_calls > 0, timeout=3.0)
+
+    def test_clear_memory_is_callable_from_another_thread(self):
+        a, _ = make_assistant()
+        a.memory.add_exchange("你好", "你也好")
+        assert a.memory.turn_count == 1
+        a.clear_memory()
+        assert a.memory.turn_count == 0
+
+
+class TestLevelHook:
+    """电平是可选钩子：界面不能自己开第二个麦克风流抢设备。"""
+
+    def test_absent_hook_is_a_noop(self):
+        a, _ = make_assistant()
+        assert a.on_level is None
+        for _ in range(5):
+            a._maybe_report_level(FRAME)   # 不该抛，也不该有任何副作用
+
+    def test_reports_microphone_level_at_a_throttled_rate(self):
+        a, _ = make_assistant()
+        seen: list[tuple[float, str]] = []
+        a.on_level = lambda level, source: seen.append((level, source))
+
+        for _ in range(6):
+            a._maybe_report_level(FRAME)
+
+        assert len(seen) == 2, f"每 3 帧报一次，6 帧应当报 2 次，实际 {len(seen)}"
+        assert all(source == "mic" for _, source in seen)
+
+    def test_a_failing_hook_does_not_break_the_loop(self):
+        a, _ = make_assistant()
+
+        def boom(level, source):
+            raise RuntimeError("界面代码炸了")
+
+        a.on_level = boom
+        for _ in range(4):
+            a._maybe_report_level(FRAME)   # 订阅方出错不该拖垮音频链路
+
 

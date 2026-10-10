@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
 
 from app.audio.devices import resolve_device, resolve_name
-from app.audio.wav import parse_wav
+from app.audio.wav import parse_wav, pcm_rms
 from app.config import AudioSettings
 from app.core.errors import AudioDeviceError
 from app.core.logger import get_logger
@@ -30,6 +31,11 @@ log = get_logger(__name__)
 # 播放分块的最大时长（毫秒）。块越小 stop() 响应越快，但系统调用越频繁。
 # 20ms 是实测下来「响应速度」与「CPU 开销」的平衡点。
 _MAX_BLOCK_MS = 20
+
+# 每隔几个音频块回报一次播放电平。块本身是 20ms，即 50 块/秒；
+# 每 3 块一次约 16Hz，足够让界面上的波形看起来连续，
+# 又不至于用 50Hz 的重绘把 CPU 吃满。
+_LEVEL_EVERY_N_BLOCKS = 3
 
 
 def parse_audio(data: bytes, fallback_rate: int) -> tuple[bytes, int, int]:
@@ -49,13 +55,22 @@ def parse_audio(data: bytes, fallback_rate: int) -> tuple[bytes, int, int]:
 class Speaker:
     """扬声器。"""
 
-    def __init__(self, settings: AudioSettings) -> None:
+    def __init__(
+        self,
+        settings: AudioSettings,
+        *,
+        on_level: Callable[[float], None] | None = None,
+    ) -> None:
         self.settings = settings
         self._device_index: int | None = None
         self._device_resolved = False
         self._stop_event = threading.Event()
         self._playing = threading.Event()
         self._lock = threading.Lock()
+        # 可选的播放电平回调（M4 界面用它驱动光球的脉动）。
+        # 为 None 时连能量都不算 —— 不订阅就零开销。
+        self._on_level = on_level
+        self._level_tick = 0
 
     # ---------- 设备 ----------
 
@@ -195,9 +210,26 @@ class Speaker:
                     break
                 frames = np.frombuffer(chunk[:usable], dtype=np.int16)
                 stream.write(frames.reshape(-1, channels))
+                self._report_level(chunk[:usable])
             else:
                 # for-else：没被打断 → 等硬件缓冲真正播完再返回
                 time.sleep(0.05)
+
+    def _report_level(self, chunk: bytes) -> None:
+        """限频地把播放电平报给订阅方（M4 界面用它驱动光球的脉动）。
+
+        回调抛错只记 debug：界面上少画一帧波形，远没有让播报中断严重。
+        """
+        hook = self._on_level
+        if hook is None:
+            return
+        self._level_tick += 1
+        if self._level_tick % _LEVEL_EVERY_N_BLOCKS:
+            return
+        try:
+            hook(pcm_rms(chunk))
+        except Exception as exc:  # noqa: BLE001 — 订阅方出错不该拖垮播放
+            log.debug("播放电平回调抛错：%s", exc)
 
     def beep(self, frequency: int = 880, duration: float = 0.12) -> None:
         """提示音。用于「唤醒成功」「录音开始」等状态反馈。"""

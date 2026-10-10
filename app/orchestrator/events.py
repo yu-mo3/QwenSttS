@@ -1,4 +1,15 @@
-"""L5 编排层的**统一事件契约**。
+"""L5 与 L6 之间的**通信契约**：事件（L5 -> L6）与指令（L6 -> L5）。
+
+## 两个方向为什么长这样
+
+    L5 -> L6   事件：编排层主动广播，界面只订阅、不回应
+    L6 -> L5   指令：界面投进队列，主循环每帧排空一次
+
+指令走队列而不是直接调方法，是因为**指令由 GUI 线程发出、而状态字段
+由主循环线程独占** —— 直接调用就是数据竞争。队列是线程安全的，
+主循环排空它的时候天然串行化。也不用锁：用户按下按钮本来就该
+「尽快生效、绝不阻塞界面」，加锁只会把等待和超时引进来。
+
 
 ## 这个模块为什么存在（KI-006）
 
@@ -59,6 +70,23 @@ EVT_RECORDING_DONE = "recording_done"
 
 
 # ══════════════════════════════════════════════════════════
+#  指令（L6 -> L5）
+# ══════════════════════════════════════════════════════════
+
+CMD_LISTEN = "listen"
+CMD_STOP_SPEAKING = "stop_speaking"
+CMD_SUBMIT_TEXT = "submit_text"
+CMD_RESET = "reset"
+CMD_SHUTDOWN = "shutdown"
+
+#: 全部合法指令。VoiceAssistant 收到表外的指令会记一条 warning 而不是抛异常
+#: —— 界面上按错一个按钮，不该让整个会话崩掉。
+ALL_COMMANDS: frozenset[str] = frozenset(
+    {CMD_LISTEN, CMD_STOP_SPEAKING, CMD_SUBMIT_TEXT, CMD_RESET, CMD_SHUTDOWN}
+)
+
+
+# ══════════════════════════════════════════════════════════
 #  载荷契约
 # ══════════════════════════════════════════════════════════
 
@@ -78,7 +106,9 @@ _R = frozenset
 
 PAYLOAD_CONTRACTS: dict[str, EventContract] = {
     # ---- 两个编排器都会发 ----
-    EVT_ASR_DONE: EventContract(_R({"text", "emotion", "elapsed"})),
+    # source 区分「说出来的」和「打字的」：两者走同一条下游路径，
+    # 但事件日志里必须看得出来，否则排障时会以为麦克风出了问题
+    EVT_ASR_DONE: EventContract(_R({"text", "emotion", "elapsed"}), _R({"source"})),
     EVT_LLM_DONE: EventContract(_R({"text", "sentences", "first_byte"})),
     # total 是 KI-006 的核心：M4 的界面靠它显示「第 i / N 句」
     EVT_TTS_DONE: EventContract(_R({"index", "total", "duration"})),

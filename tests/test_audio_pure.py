@@ -9,6 +9,7 @@ import pytest
 
 from app.audio.capture import Microphone
 from app.audio.player import Speaker, parse_audio
+from app.audio.wav import pcm_rms
 from app.config import AudioSettings
 
 
@@ -112,6 +113,8 @@ def _devicefree_speaker(blocks: int = 4, stop_at: int | None = None):
     speaker._stop_event = threading.Event()
     speaker._playing = threading.Event()
     speaker._lock = threading.Lock()
+    speaker._on_level = None
+    speaker._level_tick = 0
     played: list[int] = []
 
     def fake_play_loop(pcm, rate, channels) -> None:
@@ -176,3 +179,65 @@ class TestSpeakerStopLatch:
         assert speaker._stop_event.is_set() is False
         speaker.stop()
         assert speaker._stop_event.is_set() is True
+
+class TestPcmRms:
+    """共享的电平计算。麦克风与扬声器两侧都用它驱动界面波形。"""
+
+    def test_empty_is_zero(self) -> None:
+        assert pcm_rms(b"") == 0.0
+
+    def test_odd_length_is_truncated_not_raised(self) -> None:
+        """np.frombuffer 遇奇数字节抛裸 ValueError，不属于 AyuanError 家族。
+
+        M1 审查已经因为这个坑修过一次 Microphone.rms —— 新加的这份
+        实现必须同样安全，否则等于把修好的坑在另一处重新挖开。
+        """
+        assert pcm_rms(b"\x01") == 0.0
+        assert pcm_rms(b"\x01\x02\x03") > 0.0
+
+    def test_silence_is_zero(self) -> None:
+        assert pcm_rms(b"\x00" * 640) == 0.0
+
+    def test_louder_signal_has_higher_level(self) -> None:
+        quiet = np.full(320, 100, dtype=np.int16).tobytes()
+        loud = np.full(320, 8000, dtype=np.int16).tobytes()
+        assert pcm_rms(loud) > pcm_rms(quiet) > 0.0
+
+    def test_full_scale_is_one(self) -> None:
+        peak = np.full(320, 32767, dtype=np.int16).tobytes()
+        assert pcm_rms(peak) == pytest.approx(1.0, abs=1e-3)
+
+    def test_agrees_with_microphone_rms(self) -> None:
+        pcm = np.arange(-500, 500, dtype=np.int16).tobytes()
+        assert pcm_rms(pcm) == pytest.approx(Microphone.rms(pcm))
+
+
+class TestSpeakerLevelReporting:
+    """播放电平回吐给界面，让光球跟着真实音量脉动而不是放个假正弦波。"""
+
+    def test_no_hook_is_a_noop(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        assert speaker._on_level is None
+        for _ in range(5):
+            speaker._report_level(b"\x00" * 640)
+
+    def test_levels_are_throttled(self) -> None:
+        speaker, _ = _devicefree_speaker()
+        seen: list[float] = []
+        speaker._on_level = seen.append
+
+        for _ in range(6):
+            speaker._report_level(b"\x00" * 640)
+
+        assert len(seen) == 2, f"每 3 块报一次，6 块应当报 2 次，实际 {len(seen)}"
+
+    def test_a_failing_hook_does_not_break_playback(self) -> None:
+        speaker, _ = _devicefree_speaker()
+
+        def boom(level: float) -> None:
+            raise RuntimeError("界面代码炸了")
+
+        speaker._on_level = boom
+        for _ in range(4):
+            speaker._report_level(b"\x00" * 640)   # 不该往外抛
+
