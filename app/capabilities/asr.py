@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import base64
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.capabilities.base import (
     CallStats,
@@ -40,7 +40,6 @@ class Transcript:
     emotion: str = ""
     duration: float = 0.0
     stats: CallStats | None = None
-    raw: dict = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -50,9 +49,14 @@ class Transcript:
 class SpeechRecognizer:
     """语音识别。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        on_retry: Callable[[int, int, str], None] | None = None,
+    ) -> None:
         self.config = config
-        self.http = HttpClient(config)
+        self.http = HttpClient(config, on_retry=on_retry)
 
     @property
     def model(self) -> str:
@@ -105,6 +109,7 @@ class SpeechRecognizer:
                 payload,
             ),
             what="语音识别",
+            on_retry=self.http.on_retry,
         )
         elapsed = time.monotonic() - started
 
@@ -118,7 +123,7 @@ class SpeechRecognizer:
         )
         log.debug("识别完成：%s", stats.summary())
 
-        return Transcript(text=text, emotion=emotion, duration=duration, stats=stats, raw=body)
+        return Transcript(text=text, emotion=emotion, duration=duration, stats=stats)
 
     @staticmethod
     def _parse(body: dict) -> tuple[str, str]:
@@ -130,23 +135,38 @@ class SpeechRecognizer:
                 "annotations": [{"emotion": "happy", "language": "zh"}]
             }}]}}
         """
+        # 整个结构遍历都必须在 try 内。
+        # 原先只有「取 message」那一行在 try 里，后面的 message.get 与
+        # "".join 一旦遇到畸形结构就抛裸 AttributeError / TypeError 穿透到用户
+        # —— 这正是 M1 修过的同一类坑（异常不属于 AyuanError 家族，上层兜不住）。
         try:
             message = body["output"]["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError) as exc:
+            if not isinstance(message, dict):
+                raise TypeError(f"message 应为字典，实际是 {type(message).__name__}")
+
+            content = message.get("content")
+            if isinstance(content, list):
+                # 用 or 而不是 get 的默认值：云端可能显式返回 null，
+                # 那时 part.get("text", "") 会拿到 None，join 会炸
+                text = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            elif isinstance(content, str):
+                text = content
+            else:
+                text = ""
+
+            annotations = message.get("annotations") or []
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
             raise ApiError(
                 "无法解析语音识别结果",
                 hint=f"返回结构不符合预期：{str(body)[:200]}",
             ) from exc
 
-        content = message.get("content")
-        text = ""
-        if isinstance(content, list):
-            text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        elif isinstance(content, str):
-            text = content
-
         emotion = ""
-        for annotation in message.get("annotations") or []:
+        for annotation in annotations:
             if isinstance(annotation, dict) and annotation.get("emotion"):
                 emotion = str(annotation["emotion"])
                 break
