@@ -21,7 +21,7 @@ import requests
 
 # WAV 编解码统一由 app/audio/wav.py 提供（那里处理了「流式 WAV 假 size」的坑），
 # 这里重新导出，让能力层不必知道它住在哪一层
-from app.audio.wav import pcm_duration, pcm_to_wav, wav_duration  # noqa: F401
+from app.audio.wav import pcm_to_wav, wav_duration  # noqa: F401
 from app.config import Config
 from app.core.errors import ApiError
 from app.core.logger import get_logger
@@ -74,6 +74,7 @@ def call_with_retry(
     what: str,
     attempts: int = 3,
     delay: float = 1.0,
+    on_retry: Callable[[int, int, str], None] | None = None,
 ) -> T:
     """执行一次云端调用，对「可重试的失败」自动重试。
 
@@ -84,24 +85,38 @@ def call_with_retry(
 
     其余情况（401 密钥错、400 参数错）立即抛出 —— 重试没有意义，
     只会让用户多等几秒。
+
+    on_retry 在每次失败后、真正重试前调用，参数 (第几次, 总次数, 原因)。
+    订阅方用它给用户反馈 —— 否则最坏情况（3 次 60s 超时 + 退避 = 183 秒）
+    会全程静默，用户只会以为程序死了然后强杀。
     """
     last_error: Exception | None = None
 
     for attempt in range(1, attempts + 1):
+        reason = ""
         try:
             return fn()
         except ApiError as exc:
             last_error = exc
-            if exc.status_code not in _RETRYABLE_STATUS:
+            # 显式的 retryable 优先；没有它时退回看 HTTP 状态码。
+            # 网络层异常没有状态码，只能靠 retryable 表达「值得再试一次」。
+            if not (exc.retryable or exc.status_code in _RETRYABLE_STATUS):
                 raise
-            log.warning("%s 第 %d/%d 次失败（HTTP %s），准备重试", what, attempt, attempts, exc.status_code)
+            reason = exc.message
+            log.warning("%s 第 %d/%d 次失败（%s），准备重试", what, attempt, attempts, reason)
         except Exception as exc:  # noqa: BLE001 — 需要按类型分流
             last_error = exc
             if not _looks_like_network_error(exc):
                 raise
+            reason = f"{type(exc).__name__}: {exc}"
             log.warning("%s 第 %d/%d 次失败（网络），准备重试", what, attempt, attempts)
 
         if attempt < attempts:
+            if on_retry is not None:
+                try:
+                    on_retry(attempt, attempts, reason)
+                except Exception:  # 订阅方出错不该拖垮重试
+                    pass
             time.sleep(delay * attempt)
 
     raise ApiError(
@@ -117,8 +132,16 @@ class HttpClient:
     的 ApiError。编排层不需要认识 requests。
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        on_retry: Callable[[int, int, str], None] | None = None,
+    ) -> None:
         self.config = config
+        # 重试回调：让上层能把「正在重试」告诉用户。没有它的话，
+        # 最坏情况（3 次 60s 超时 + 退避）会静默挂起约 3 分钟。
+        self.on_retry = on_retry
         self._session = requests.Session()
 
     @property
@@ -133,9 +156,22 @@ class HttpClient:
         try:
             response = self._session.post(url, headers=self._headers, json=payload, timeout=timeout)
         except requests.Timeout as exc:
-            raise ApiError("请求云端超时", hint=f"超过 {timeout} 秒未响应，可能是网络较慢", status_code=408) from exc
+            # 同时给 status_code 与 retryable：前者供错误提示使用，
+            # 后者是重试判定的唯一语义来源
+            raise ApiError(
+                "请求云端超时",
+                hint=f"超过 {timeout} 秒未响应，可能是网络较慢",
+                status_code=408,
+                retryable=True,
+            ) from exc
         except requests.RequestException as exc:
-            raise ApiError("无法连接云端服务", hint=f"请检查网络连接：{exc}") from exc
+            # retryable=True：网络层异常没有 HTTP 状态码，必须显式标记，
+            # 否则会被 call_with_retry 当成「不可重试」直接抛出
+            raise ApiError(
+                "无法连接云端服务",
+                hint=f"请检查网络连接：{exc}",
+                retryable=True,
+            ) from exc
 
         return self._handle(response)
 
@@ -145,7 +181,7 @@ class HttpClient:
         try:
             response = self._session.get(url, timeout=timeout)
         except requests.RequestException as exc:
-            raise ApiError("下载音频失败", hint=str(exc)) from exc
+            raise ApiError("下载音频失败", hint=str(exc), retryable=True) from exc
 
         if response.status_code != 200:
             raise ApiError(

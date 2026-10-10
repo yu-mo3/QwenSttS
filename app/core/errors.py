@@ -28,8 +28,24 @@ class AudioDeviceError(AyuanError):
 
 
 class ApiError(AyuanError):
-    """云端接口调用失败。"""
+    """云端接口调用失败。
 
-    def __init__(self, message: str, *, hint: str = "", status_code: int | None = None) -> None:
+    retryable 是**显式的语义位**，而不是让调用方从 status_code 去猜。
+
+    原因（真实踩过的坑）：网络层异常（连接被拒、DNS 失败、连接重置）
+    根本没有 HTTP 状态码。只靠 status_code 判断「该不该重试」，这类错误
+    会被一律当成不可重试 —— call_with_retry 的 docstring 承诺重试网络抖动，
+    实际上**一次都没重试过**。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        hint: str = "",
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message, hint=hint)
         self.status_code = status_code
+        self.retryable = retryable
