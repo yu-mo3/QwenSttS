@@ -2,9 +2,23 @@
 
 **铁律**：界面只发命令、只订阅事件，不认识任何模型。
 
-这条铁律靠一个边界来守：本包里**只有 controller.py 允许 import 编排层**，
-其余模块（theme / main_window / orb / history / tech_panel / settings_panel /
-tray）只认 Qt 与自己的信号。
+这条铁律靠两条边界来守：
+
+1. **只有 controller.py 允许 import 编排层的实现**
+   （`app.orchestrator.assistant`）。其余模块只认 Qt 与自己的信号。
+2. **契约模块例外且仅限两个**：`app.orchestrator.events`（事件名与载荷形状）
+   与 `app.orchestrator.states`（状态枚举）是 L5 与 L6 之间的约定，
+   界面必须知道它们 —— 否则连「现在是什么状态」都判断不了。
+   它们只含常量与枚举，不含任何逻辑。
+
+真正不能碰的是**能力层与设备层**：本包里一处都不许出现
+`app.capabilities.*` 或 `app.audio.*` / `app.camera.*`。
+这条有静态检查守着（见 tests/test_ui_pure.py 的分层测试）。
+
+> 早先这里写的是「只有 controller.py 允许 import 编排层」，
+> 而 theme / orb / tray / main_window 都 import 了 `states` ——
+> 注释与代码不符，而且把真正的边界（不许碰能力层与设备层）遮住了。
+> 那是 M4 审查的 R9，M5 收尾时改正。
 
 ## 为什么这里有一行副作用
 

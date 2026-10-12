@@ -166,7 +166,23 @@
 | **问题** | ① **R7**：`SUBSCRIBED_EVENTS` 里 5 个事件没有专门信号，只进技术面板原始日志 —— 这是「事件日志留全量」的设计本意，**不是缺陷**<br>② **R8**：README 三处小出入 —— 说「内置 4 个调试配置」实际 11 个；说 `app/main.py` 是 F5 默认入口（M4 起默认是界面）；对比表写「asyncio + Qt 信号槽」而 `app/` 里 `asyncio` 只出现在 logger 静音名单<br>③ `app/ui/__init__.py` 自称「只有 controller.py 允许 import 编排层」，实际 theme/orb/tray/main_window 都 import 了 `states`（那是契约模块，正当使用） |
 | **影响** | 读到的人会找错入口 / 误判技术栈；注释与代码不符 |
 | **为什么不修** | ②③ 是文档措辞，不影响任何行为；① 本就符合设计 |
-| **何时重做** | M5 收尾做「文档收口」时顺手改 —— 那一步本来就要通读一遍 README |
+| **何时重做** | 原计划「M5 收尾做文档收口时顺手改」 |
+| **✅ 结果** | M5-6 已改：README 的调试配置数（4 -> 11）、`app/main.py` 的入口定位、`asyncio` 那处技术栈误述；`app/ui/__init__.py` 的边界说明改写成「契约模块例外且仅限两个」，并把真正的边界（不许碰能力层与设备层）写清楚 |
+
+---
+
+### KI-012 · 本机摄像头打不开（环境问题，非代码缺陷）
+
+| 项 | 内容 |
+|---|---|
+| **来源** | M5 开发过程中的实测 |
+| **级别** | — （不是缺陷，是环境事实） |
+| **位置** | `app/camera/` |
+| **现象** | OpenCV 的 DSHOW / MSMF / FFMPEG / ANY **四个后端全部打不开**，一律报 `backend is generally available but can't be used to capture by index`；独立的 ffmpeg 也报 `Unable to BindToObject` |
+| **已排查过的** | 设备状态 OK、ProblemCode=0、Present=True；Windows 隐私设置是 Allow（含桌面应用 NonPackaged）；没有任何进程占用（`LastUsedTimeStop` 无「正在使用」标记）；opencv-python **4.14 与 5.0 表现一致**，所以不是版本问题 |
+| **结论** | 项目所有者确认**摄像头本来就没开**，因此不追 |
+| **视觉链路怎么验证的** | `tools/m5_vision.py --image 图片.jpg` 绕开摄像头，真调 `qwen3-vl-plus` 得到正确描述（实测 1.8~2.0s）。**拍照与理解是两段，任何一段坏了都能单独定位** —— 这也是那个 `--image` 参数存在的意义 |
+| **给下一个人** | 真机上摄像头打不开时先跑 `tools/check_camera.py`，它会打出一份五步排查清单。**不要**照着 OpenCV 的报错去怀疑代码 —— 本项目的摄像头代码只做三件事：打开、抓帧、编码，三条都有测试 |
 
 ---
 ## 已修复（留存索引）
@@ -191,3 +207,10 @@
 | M4 自查 | 打字发送后用户气泡出现两次（界面与事件流各记一笔） | `test_ui_pure.py::TestInputRow::test_sending_does_not_double_up_the_bubble` |
 | M4 自查 | 光晕与涟漪溢出控件被裁成方形暗边 | `test_ui_pure.py::TestOrbFitsInsideItsWidget`（3 条） |
 | M4 自查 | `timings["合计"]` 被存下来又被求和，合计虚高 | `test_events_pure.py::test_orchestrators_never_store_the_timing_total` |
+| M4 审查 R1 | 有托盘时退出不退进程，麦克风一直占着 | `test_ui_pure.py::TestQuitActuallyQuits`（5 条）+ 端到端探针（含对照组） |
+| M4 审查 R2 | `run()` 打开设备失败后实例永久不可复用 | `test_assistant_pure.py::TestOpenFailureDoesNotPoisonTheInstance` |
+| M4 自查 A1 | 干净克隆上 2 条测试失败（需要唤醒模型） | 模拟干净克隆实测 526 passed / 0 failed |
+| M4 审查 R4 | 一条断言只是「非空」的空转测试 | `test_ui_pure.py::test_every_subscribed_event_has_a_signal_or_is_declared_log_only` |
+| M5 自查 | 打包时 Qt 平台插件被静默丢弃，产物跑不起来 | `ayuan.spec` 的构建期自检（少一个插件就拒绝出包） |
+| M5 自查 | 视觉触发词「这是什么意思」被误判成要拍照 | `test_vision_pure.py::TestVisionIntent`（20 条） |
+| M5 自查 | 工具失败会让整轮对话失败（而不是变成一句「我查不到」） | `test_agent_pure.py::TestExecutionNeverRaises`（12 条） |
