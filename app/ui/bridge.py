@@ -52,7 +52,11 @@ from app.orchestrator.events import (
     EVT_SPEECH_END,
     EVT_SPEECH_START,
     EVT_STATE,
+    EVT_TOOL_DONE,
+    EVT_TOOL_START,
     EVT_TTS_DONE,
+    EVT_VISION_DONE,
+    EVT_VISION_START,
     EVT_WAKE,
 )
 
@@ -143,6 +147,14 @@ class EventBridge(QObject):
     #: 出错（消息, 提示）
     failed = Signal(str, str)
 
+    #: 开始拍照 / 看完了（描述, 耗时）。M5。
+    vision_started = Signal()
+    vision_finished = Signal(str, float)
+
+    #: 开始调用工具 / 调用完了（名字, 是否成功, 耗时）。M5。
+    tool_started = Signal(str, dict)
+    tool_finished = Signal(str, bool, float)
+
     #: 会话正常结束（统计摘要）—— 由编排层的 exit 事件驱动
     session_finished = Signal(str)
 
@@ -190,6 +202,22 @@ class EventBridge(QObject):
             )
         elif event == EVT_EXIT:
             self.session_finished.emit(str(payload.get("stats", "")))
+        elif event == EVT_VISION_START:
+            self.vision_started.emit()
+        elif event == EVT_VISION_DONE:
+            self.vision_finished.emit(
+                str(payload.get("text", "")), float(payload.get("elapsed", 0.0))
+            )
+        elif event == EVT_TOOL_START:
+            self.tool_started.emit(
+                str(payload.get("name", "")), dict(payload.get("arguments") or {})
+            )
+        elif event == EVT_TOOL_DONE:
+            self.tool_finished.emit(
+                str(payload.get("name", "")),
+                bool(payload.get("ok", False)),
+                float(payload.get("elapsed", 0.0)),
+            )
 
     def feed_level(self, level: float, source: str) -> None:
         """从任意线程调用。电平已经在 L5 限频过，这里只管转发。"""
@@ -232,5 +260,11 @@ SUBSCRIBED_EVENTS = frozenset(
         EVT_IDLE_TIMEOUT,
         EVT_ERROR,
         EVT_EXIT,
+        # M5：多模态与工具。四者都有专门信号 —— 界面要显示
+        # 「正在查天气…」和「我看了一眼：…」，光进日志不够。
+        EVT_VISION_START,
+        EVT_VISION_DONE,
+        EVT_TOOL_START,
+        EVT_TOOL_DONE,
     }
 )

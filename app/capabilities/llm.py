@@ -409,6 +409,7 @@ class ChatProvider:
         *,
         tools=None,
         on_tool=None,
+        on_tool_start=None,
     ) -> ChatReply:
         """完整的一轮对话：发送 -> 流式接收 -> （必要时调工具）-> 分句。
 
@@ -416,7 +417,9 @@ class ChatProvider:
             tools: ToolRegistry 或 None。**None 时行为与 M2 完全一致** ——
                 不带 tools 参数、不做额外请求、首字延迟一点不变。
             on_tool: 每次工具执行完的回调，参数是 ToolCallRecord。
-                界面用它显示「正在查天气…」，而不是让她沉默三秒。
+            on_tool_start: 每次工具**执行前**的回调，参数是 (名字, 参数)。
+                界面用它显示「正在查天气…」—— 等执行完再显示就晚了，
+                那时用户已经对着沉默等了两秒。
         """
         if not user_text.strip():
             raise ApiError("对话内容为空", hint="没有识别到有效的用户输入")
@@ -477,6 +480,14 @@ class ChatProvider:
                     log.warning("本轮工具调用次数已达上限 %d，剩下的跳过", MAX_TOOL_CALLS_PER_TURN)
                     break
                 executed += 1
+                if on_tool_start is not None:
+                    try:
+                        on_tool_start(
+                            call.get("name") or "",
+                            _safe_arguments(call.get("arguments") or ""),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("工具开始回调抛错：%s", exc)
                 record = _run_tool(tools, call)
                 records.append(record)
                 log.info("工具 %s", record.summary())

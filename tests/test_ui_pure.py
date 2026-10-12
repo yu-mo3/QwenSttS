@@ -55,7 +55,7 @@ from app.ui.history import (  # noqa: E402
     describe_first_byte,
     format_clock,
 )
-from app.ui.main_window import MainWindow  # noqa: E402
+from app.ui.main_window import MainWindow, tool_label  # noqa: E402
 from app.ui.bridge import (  # noqa: E402
     LOG_ONLY_EVENTS,
     SOURCE_MIC,
@@ -159,6 +159,12 @@ class TestEventBridgeMapping:
         b.idle_timeout.connect(rec("idle"))
         b.failed.connect(rec("failed"))
         b.session_finished.connect(rec("finished"))
+        # M5 的信号也要接上 —— 否则「每个订阅事件要么有专门信号、
+        # 要么显式声明只进日志」那条测试会把它们当成漏网之鱼。
+        b.vision_started.connect(rec("vision_started"))
+        b.vision_finished.connect(rec("vision_finished"))
+        b.tool_started.connect(rec("tool_started"))
+        b.tool_finished.connect(rec("tool_finished"))
         return b, seen
 
     def test_every_event_reaches_the_raw_log(self):
@@ -1450,4 +1456,92 @@ class TestQuitActuallyQuits:
         window.hide()
         window.request_shutdown()
         assert calls == ["quit"]
+
+
+# ══════════════════════════════════════════════════════
+#  M5：视觉与工具在界面上的表现
+# ══════════════════════════════════════════════════════
+
+class TestToolLabel:
+    def test_known_tool_gets_a_chinese_action(self):
+        assert tool_label("get_weather") == "查天气"
+
+    def test_unknown_tool_falls_back_to_its_own_name(self):
+        """将来加了新工具，界面上至少还能看出它叫什么，
+        而不是显示成「未知工具」让人无从下手。"""
+        assert tool_label("get_stock_price") == "get_stock_price"
+
+    def test_empty_name_does_not_break(self):
+        assert tool_label("")
+
+
+class TestVisionAndToolDisplay:
+    def test_vision_start_shows_a_hint(self, window):
+        """拍照加识别大约 2 秒。不提示的话用户只会觉得她卡住了。"""
+        window.bridge.vision_started.emit()
+        assert "看" in window.hint_label.text()
+
+    def test_vision_result_lands_in_the_history(self, window):
+        window.bridge.vision_finished.emit("一只橘猫趴在键盘上", 1.8)
+        text = window.history.to_plain_text()
+        assert "一只橘猫" in text
+        assert "1.8" in text
+
+    def test_vision_finish_restores_the_state_hint(self, window):
+        window.on_state_changed("待机", "思考")
+        window.bridge.vision_started.emit()
+        window.bridge.vision_finished.emit("一只猫", 1.0)
+        assert window.hint_label.text() == theme.style_for(AssistantState.THINKING).hint
+
+    def test_empty_vision_text_does_not_add_a_blank_note(self, window):
+        window.bridge.vision_finished.emit("", 1.0)
+        assert "画面里是" not in window.history.to_plain_text()
+
+    def test_tool_start_shows_what_she_is_doing(self, window):
+        window.bridge.tool_started.emit("get_weather", {"location": "北京"})
+        assert "查天气" in window.hint_label.text()
+
+    def test_tool_success_lands_in_the_history(self, window):
+        window.bridge.tool_finished.emit("get_weather", True, 0.42)
+        text = window.history.to_plain_text()
+        assert "查天气" in text and "✓" in text
+
+    def test_tool_failure_is_marked(self, window):
+        """查不到也要看得见 —— 静默失败是这个项目反复踩的坑。"""
+        window.bridge.tool_finished.emit("get_weather", False, 0.31)
+        assert "✗" in window.history.to_plain_text()
+
+    def test_tool_finish_restores_the_state_hint(self, window):
+        window.on_state_changed("待机", "思考")
+        window.bridge.tool_started.emit("get_weather", {})
+        window.bridge.tool_finished.emit("get_weather", True, 0.4)
+        assert window.hint_label.text() == theme.style_for(AssistantState.THINKING).hint
+
+    def test_unknown_tool_name_still_readable(self, window):
+        window.bridge.tool_finished.emit("get_stock_price", True, 0.4)
+        assert "get_stock_price" in window.history.to_plain_text()
+
+    def test_bridge_maps_the_new_events(self):
+        bridge = EventBridge()
+        seen: dict[str, list] = {}
+
+        def rec(name):
+            def _slot(*args):
+                seen.setdefault(name, []).append(args)
+            return _slot
+
+        bridge.vision_started.connect(rec("vision_started"))
+        bridge.vision_finished.connect(rec("vision_finished"))
+        bridge.tool_started.connect(rec("tool_started"))
+        bridge.tool_finished.connect(rec("tool_finished"))
+
+        bridge.feed_event("vision_start", {})
+        bridge.feed_event("vision_done", {"text": "一只猫", "elapsed": 1.2})
+        bridge.feed_event("tool_start", {"name": "get_weather", "arguments": {"location": "北京"}})
+        bridge.feed_event("tool_done", {"name": "get_weather", "ok": True, "elapsed": 0.4})
+
+        assert "vision_started" in seen
+        assert seen["vision_finished"] == [("一只猫", 1.2)]
+        assert seen["tool_started"] == [("get_weather", {"location": "北京"})]
+        assert seen["tool_finished"] == [("get_weather", True, 0.4)]
 
