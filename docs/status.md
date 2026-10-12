@@ -28,6 +28,10 @@
 | 视觉理解 | `qwen3-vl-plus` | 实测准确 |
 | 唤醒方案 | sherpa-onnx KWS（**不是** Vosk+拼音匹配） | 「阿源」只有 2 音节，拼音匹配会被「原来/员工/原因」频繁误触发 |
 | 唤醒词 | `ā y uán @阿源`，阈值 0.2 | token 写法是穷举试出来的，见第六节 |
+| 摄像头（M5） | **L2 设备层单独成包** `app/camera/` + opencv-python | 与 app/audio/ 并列的第二个设备域；不用 QtMultimedia（那是 L6 的工具箱，设备层不许 import） |
+| 工具池（M5） | **function calling**，走 OpenAI 兼容端点 | 已实测 qwen3.8-27b 关思考后支持；不做「听到天气关键词就查」那种假装成 Agent 的路由 |
+| 视觉触发（M5） | 从 **ASR 文本**匹配，不给 KWS 加关键词 | 「看看这是什么」是对话内容不是唤醒词；KWS 加词要穷举 token + 真人复测一轮 |
+| 打包（M5） | PyInstaller **onedir + 模型入包** | 启动快、能翻目录排查、首次运行不依赖网络 |
 | UI（M4） | PySide6，脸谱式主界面 + 右侧对话历史 | 用户选定 |
 | 界面实现 | **QPainter 纯代码自绘**光球，零美术素材 | 项目没有任何图片资源，且四态要连续插值（切图会跳变） |
 | Qt 依赖 | **PySide6-Essentials**，不是完整 PySide6 | 完整包多拖 WebEngine 131.7MB + Addons 40.5MB，一行都用不到 |
@@ -58,16 +62,17 @@
 | M1 | 工程骨架 · L1 基础层 · L2 设备层 · 环境自检 | ✅ 已完成（PR #1/#2/#3） |
 | M2 | L4 能力层（ASR/LLM/TTS）· L5 单轮流水线 | ✅ 已完成（PR #4） |
 | M3 | L3 感知层 · L5 状态机 + 连续对话 + 打断 + 边说边播 | ✅ 已完成（PR #5） |
-| M4 | L6 表现层：PySide6 桌面界面 | ✅ 已完成（已并入 main） |
-| **M5** | **视觉理解 + Agent 工具池 + 打包 + 交接文档** | ⏳ **下一个** |
+| M4 | L6 表现层：PySide6 桌面界面 | ✅ 已完成 |
+| **M5** | **视觉理解 + Agent 工具池 + 打包分发** | ✅ 已完成（**待并入 main**） |
 
-**测试**：372 条全部通过，`pytest -q` 直接跑。
+**测试**：526 条全部通过，`pytest -q` 直接跑，**干净克隆上同样全过**。
 **界面**：`python -m app.ui` —— 脸谱式光球 / 对话历史 / 技术面板 / 托盘 / 设置。
+**分发**：`build.bat` → `dist/Ayuan/`，解压双击即用，唤醒模型已打包在内。
 **审查**：每个里程碑完成后派独立子智能体审查，报告存档在 `docs/reviews/`。
 M4 报告见 [reviews/m4-review.md](reviews/m4-review.md)：1 个 🔴 + 3 个 🟡 + 6 个 🟢。
 **🔴 R1（有托盘时退出不退进程）与 R2 / A1 / R4 已修**；
 其余未修的已按流程记入 [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) 的 KI-008 ~ KI-011。
-**M5 不做独立审查**（项目所有者决定，M5 之后项目收工）。
+**M5 不做独立审查**（项目所有者决定）。**M5 之后项目收工。**
 
 ---
 
@@ -76,10 +81,13 @@ M4 报告见 [reviews/m4-review.md](reviews/m4-review.md)：1 个 🔴 + 3 个 �
 ```
 L6 表现层   app/ui/             app.py + main_window + orb + history + tech_panel
                                 + settings_panel + tray + controller + bridge
-L5 编排层   app/orchestrator/   events.py(契约) + pipeline.py(M2) + states.py + assistant.py(M3)
-L4 能力层   app/capabilities/   base / asr / llm / tts
+L5 编排层   app/orchestrator/   events.py(契约) + pipeline.py(M2) + states.py
+                                + assistant.py(M3) + vision_intent.py(M5)
+L4 能力层   app/capabilities/   base / asr / llm / tts / vlm(M5)
+            app/agent/          base / registry / weather(M5)   ← 工具池
 L3 感知层   app/perception/     vad / segmenter / wakeword
 L2 设备层   app/audio/          capture / player / devices / wav
+            app/camera/         capture(M5)                    ← 与音频并列的设备域
 L1 基础层   app/core/ + app/config.py
 ```
 
@@ -130,6 +138,31 @@ L1 基础层   app/core/ + app/config.py
     控制器按**分区**返回 `[("设备", [...]), ("参数", [...])]`，
     耦合少一处，改错的机会就少一次。
 
+### 多模态与工具（M5）
+30. **同一个 ICU 问题会在打包阶段再咬一次，而且这次不报错**。PyInstaller
+    靠 `import PySide6.QtCore` 去问 QLibraryInfo「插件在哪」，那个 import
+    失败时它只是**安静地少收一批文件**：构建日志全绿、产物也生成了，
+    但包里连一个 `qwindows.dll` 都没有，exe 一启动就死在
+    `Could not find the Qt platform plugin`。修法见 `ayuan.spec`
+    （分析前预加载 ICU + **显式收集**插件 + 构建期自检）。
+31. **windowed 包启动失败会弹错误框，进程看起来是「活着的」** ——
+    我一度把那个当成了「界面起来了」。判断打包产物能不能跑**必须看日志**，
+    不能看进程存活；所以冻结时会写 `data/ayuan.log` 与 `data/crash.log`。
+32. **工具失败必须变成结果，不能抛穿**。查天气超时是很平常的事；
+    如果它让整轮对话失败，用户听到的是「出错了」而不是「我查不到天气」。
+    注册表的 `execute()` 永不抛异常，任何失败都变成一条可回填给模型的结果。
+33. **普通聊天一次请求都不能多**。工具循环把 tools 挂在**同一次**流式请求上，
+    只有真要调工具时才多一次往返。实测量化：问「你好呀」1 轮、首字 0.47s，
+    与 M2 完全一致。写测试钉住了这条（无 tool_calls 时请求数必须 == 1）。
+34. **流式协议里的工具调用是碎片**：`arguments` 一小段一小段来，要按 index 拼；
+    name 与 id 通常只在第一片里出现，后到的空值不能覆盖已有的值。
+35. **打包后 `__file__` 指向包内部**，让用户把 `.env` 放进 `_internal` 等于
+    让他去拆包。config 因此把两个根分开：用户根（.env、data）在 exe 旁边，
+    资源根（models）在 `_MEIPASS`。
+36. **PyInstaller 的 hook 会假设发行版名**。自带的 `hook-webrtcvad` 写死了
+    `copy_metadata('webrtcvad')`，而我们装的是 **webrtcvad-wheels** ——
+    构建直接崩，而报错信息完全没提包名不对。覆盖 hook 见
+    `tools/pyinstaller_hooks/`。
 ### 工程
 24. **`.bat` 必须纯 ASCII + CRLF**（cmd.exe 用 OEM 代码页读，UTF-8 中文会撕裂命令）。
 25. **测试桩帧内容要可识别** —— 全是全零字节时，「同一帧被拼两遍」物理上看不出来。
@@ -159,8 +192,8 @@ L1 基础层   app/core/ + app/config.py
 ## 八、常用命令
 
 ```bash
-.venv\Scripts\python.exe -m pytest -q               # 跑测试（372 条）
-.venv\Scripts\python.exe -m app.ui                  # 图形界面（M4 起的主入口）
+.venv\Scripts\python.exe -m pytest -q               # 跑测试（526 条）
+.venv\Scripts\python.exe -m app.ui                  # 图形界面（主入口）
 .venv\Scripts\python.exe -m app.ui --no-session -v  # 只开界面，调版式用
 .venv\Scripts\python.exe tools\m3_assistant.py      # 免按钮语音对话（命令行入口）
 .venv\Scripts\python.exe tools\m2_chat.py --text    # 纯文字对话（免麦克风）
@@ -168,23 +201,60 @@ L1 基础层   app/core/ + app/config.py
 .venv\Scripts\python.exe -m app.main                # 项目体检面板
 .venv\Scripts\python.exe tools\wake_test.py         # 唤醒词真人验证
 .venv\Scripts\python.exe tools\download_models.py   # 下载唤醒模型（新机器）
+
+# M5：视觉与工具（都能绕开各自的外部依赖单独跑）
+.venv\Scripts\python.exe tools\m5_vision.py                    # 拍照并描述
+.venv\Scripts\python.exe tools\m5_vision.py --image 图.jpg     # 用现成的图
+.venv\Scripts\python.exe tools\m5_weather.py                   # 问她天气
+.venv\Scripts\python.exe tools\m5_weather.py --tool-only       # 只测工具
+.venv\Scripts\python.exe tools\check_camera.py                 # 摄像头自检
+
+# 打包
+build.bat                                            # 一键打包 -> dist\Ayuan\
 ```
 
 ---
 
-## 九、下一步（M5）
+## 九、项目状态（M5 之后收工）
+
+**M5 已交付**（设计方案见 [design/m5-design.md](design/m5-design.md)）：
+视觉理解（说「看看这是什么」→ 拍照 → `qwen3-vl-plus` 描述）、
+Agent 工具池（function calling，问天气真的去查）、
+PyInstaller 打包（`dist/Ayuan/`，解压双击即用）。
+
+**M5 不做独立审查**（项目所有者决定）。
+
+### 还没做、且已知的
+
+- **面向接手开发者的交接文档** —— M5 范围外，留给以后
+- [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) 里的 KI-001 ~ KI-011，
+  每条都写了「为什么不修」和「什么条件下重做」
+
+### 如果将来要继续
+
+- 加工具只需两步：写一个 `Tool` 子类，注册进 `build_registry()`。
+  **失败要抛 `ToolError`**，注册表会把它变成模型读得懂的结果。
+- 加配置项沿用 `config.update_env_file()`，别另造一套写盘逻辑 ——
+  设置面板已经占住了 `AYUAN_WAKE_THRESHOLD` / `AYUAN_STOP_THRESHOLD` /
+  `AYUAN_IDLE_TIMEOUT` 三个键。
+- 改动作幅度不用担心球体溢出：尺寸是从动效表推导的
+  （`MAX_RADIUS_RATIO = 1 / MAX_EXTENT_RATIO`）。
+- **打包前先读 `ayuan.spec` 顶部的注释** —— 那里记着两个会让构建
+  「成功但产物跑不起来」的坑。
+## 附：M5 的交付细节（历史存档）
 
 **M4 已交付**（设计方案见 [design/m4-ui-design.md](design/m4-ui-design.md)）：
 脸谱式光球（QPainter 自绘，四态各有动作语言）+ 对话历史气泡 + 文本输入
 + 技术面板（电平波形 / 设备 / 参数 / 事件日志）+ 设置面板（可写回 .env）
 + 系统托盘 + 关窗三选一。顺手收敛了 KI-006（统一事件契约）与 KI-007。
 
-**M5 待办**：
-- 视觉理解（说「看看这是什么」触发拍照 → `qwen3-vl-plus`）
-- Agent 工具池（天气，`WEATHER_API_KEY` 已预留）
-- 打包分发（PySide6-Essentials 已经为此把体积压下来了）
-- **面向接手开发者的交接文档**（目标是「新人看完就能接手」）
+**M5 已交付**（设计方案见 [design/m5-design.md](design/m5-design.md)）：
+- 视觉理解：`app/camera/`（L2）+ `app/capabilities/vlm.py`（L4）+
+  `app/orchestrator/vision_intent.py`（L5 触发判定）
+- Agent 工具池：`app/agent/` + L5 的工具调用循环（function calling）
+- 打包：`ayuan.spec` + `build.bat` → `dist/Ayuan/`，249.4MB
 
-**M5 开工前记得**：界面的设置面板已经占住了 `.env` 的三个键
-（`AYUAN_WAKE_THRESHOLD` / `AYUAN_STOP_THRESHOLD` / `AYUAN_IDLE_TIMEOUT`），
-新增配置项时沿用 `config.update_env_file()`，别另造一套写盘逻辑。
+**摄像头在本机打不开**（系统层问题：设备状态 OK、隐私是 Allow、无进程占用，
+但 OpenCV 四个后端与独立的 ffmpeg 都打不开；opencv 4.14 与 5.0 表现一致）。
+项目所有者确认**摄像头本来就没开**，所以不追。视觉链路用
+`tools/m5_vision.py --image` 验证过（真调 qwen3-vl-plus 得到正确描述）。

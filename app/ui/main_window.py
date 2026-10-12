@@ -57,6 +57,19 @@ log = get_logger(__name__)
 _BAR_CELLS = 20
 
 
+#: 工具名 -> 中文动作。展示层的东西，所以放在展示层 ——
+#: 工具自己不知道自己会被怎么称呼。
+_TOOL_LABELS = {
+    "get_weather": "查天气",
+}
+
+
+def tool_label(name: str) -> str:
+    """把工具名翻成一句人话。认不出来的原样返回，而不是显示成「未知工具」——
+    将来加了新工具，界面上至少还能看出它叫什么。"""
+    return _TOOL_LABELS.get(name, name or "调用工具")
+
+
 def _bar(level: float) -> str:
     """把 0~1 的电平画成一行方块。纯函数，方便测。"""
     filled = int(round(min(max(level, 0.0), 1.0) * _BAR_CELLS))
@@ -217,6 +230,10 @@ class MainWindow(QMainWindow):
         b.session_finished.connect(self.on_session_finished)
         b.session_stopped.connect(self.on_session_stopped)
         b.event_received.connect(self.on_event_received)
+        b.vision_started.connect(self.on_vision_started)
+        b.vision_finished.connect(self.on_vision_finished)
+        b.tool_started.connect(self.on_tool_started)
+        b.tool_finished.connect(self.on_tool_finished)
 
         self.settings_button.clicked.connect(self.on_settings_clicked)
         self.listen_button.clicked.connect(self.on_listen_clicked)
@@ -283,6 +300,30 @@ class MainWindow(QMainWindow):
     @gui_thread
     def on_speech_progress(self, index: int, total: int, duration: float) -> None:
         log.debug("播报第 %d/%d 句，%.1fs", index, total, duration)
+
+    # ---------- M5：视觉与工具 ----------
+
+    @gui_thread
+    def on_vision_started(self) -> None:
+        # 拍照 + 识别大约 2 秒。不提示的话，用户只会觉得「她卡住了」
+        self.hint_label.setText("正在看…")
+
+    @gui_thread
+    def on_vision_finished(self, text: str, elapsed: float) -> None:
+        self.history.add_note(f"我看了一眼 · {elapsed:.1f}s")
+        if text:
+            self.history.add_note(f"画面里是：{text}")
+        self.hint_label.setText(theme.style_for(self._state).hint)
+
+    @gui_thread
+    def on_tool_started(self, name: str, arguments: dict) -> None:
+        self.hint_label.setText(f"正在{tool_label(name)}…")
+
+    @gui_thread
+    def on_tool_finished(self, name: str, ok: bool, elapsed: float) -> None:
+        mark = "✓" if ok else "✗"
+        self.history.add_note(f"{tool_label(name)} {mark} {elapsed:.1f}s")
+        self.hint_label.setText(theme.style_for(self._state).hint)
 
     @gui_thread
     def on_interrupted(self) -> None:

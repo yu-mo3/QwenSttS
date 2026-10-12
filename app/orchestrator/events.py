@@ -68,6 +68,12 @@ EVT_EXIT = "exit"
 EVT_RECORDING_START = "recording_start"
 EVT_RECORDING_DONE = "recording_done"
 
+# ---- 多模态与工具（M5）----
+EVT_VISION_START = "vision_start"
+EVT_VISION_DONE = "vision_done"
+EVT_TOOL_START = "tool_start"
+EVT_TOOL_DONE = "tool_done"
+
 
 # ══════════════════════════════════════════════════════════
 #  指令（L6 -> L5）
@@ -131,6 +137,12 @@ PAYLOAD_CONTRACTS: dict[str, EventContract] = {
     # ---- 单轮流水线专有 ----
     EVT_RECORDING_START: EventContract(_R({"seconds"})),
     EVT_RECORDING_DONE: EventContract(_R({"bytes"})),
+
+    # ---- 多模态与工具（M5）----
+    EVT_VISION_START: EventContract(),
+    EVT_VISION_DONE: EventContract(_R({"text", "elapsed"})),
+    EVT_TOOL_START: EventContract(_R({"name", "arguments"})),
+    EVT_TOOL_DONE: EventContract(_R({"name", "ok", "elapsed"}), _R({"result"})),
 }
 
 #: 所有合法事件名。用于校验，也方便界面做「只订阅这几个」的白名单。

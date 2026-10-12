@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,10 +26,40 @@ from app.core.logger import get_logger
 
 log = get_logger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _is_frozen() -> bool:
+    """是不是打包成了 exe（PyInstaller 会设 sys.frozen）。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _user_root() -> Path:
+    """**用户自己的东西**放哪：.env、data/。
+
+    打包之后 `__file__` 指向的是包内部的 `_internal` 目录 ——
+    让用户把 .env 放进那里等于让他去拆包。所以冻结时改用
+    **可执行文件所在目录**：.env 就放在 exe 旁边，打开文件夹就能看见。
+    """
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _resource_root() -> Path:
+    """**随包分发的资源**放哪：models/。
+
+    这一份跟 .env 不同 —— 它是打包时就塞进去的，解包后住在
+    PyInstaller 的临时目录（`sys._MEIPASS`）里，用户不该也不需要去动它。
+    """
+    if _is_frozen():
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent.parent
+
+
+#: 用户目录（.env、data/）。保持旧名字不变 —— tools/ 与测试都在用。
+PROJECT_ROOT = _user_root()
 ENV_FILE = PROJECT_ROOT / ".env"
 DATA_DIR = PROJECT_ROOT / "data"
-MODELS_DIR = PROJECT_ROOT / "models"
+#: 模型目录来自**资源**根，不是用户根
+MODELS_DIR = _resource_root() / "models"
 
 # .env 不存在时静默跳过——跑自检脚本不该因为还没配密钥就崩溃
 load_dotenv(ENV_FILE)
@@ -168,6 +199,42 @@ class ModelSettings:
 
 
 # ══════════════════════════════════════════════════════════
+#  摄像头
+# ══════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class CameraSettings:
+    """摄像头参数（纯值对象，不读环境）。
+
+    摄像头**不做流式** —— 一次「看看这是什么」只需要一张图。
+    所以这里没有帧长/采样率那类参数，只有「怎么拿到一张能用的图」：
+
+    warmup_frames    刚打开的摄像头前几帧往往过暗或未就绪，先丢掉
+    max_empty_reads  连续读到空帧多少次就判定设备失效 —— 与 Microphone
+                     同一条纪律：**必须有终止条件**，绝不无限重试
+    max_edge         长边压到这个尺寸再编码。1080p 原图 base64 后可能上 MB，
+                     而 VLM 只需要看得清；1024 是画质与体积的平衡点
+    jpeg_quality     JPEG 质量。85 在这类「描述画面内容」的任务上肉眼无损，
+                     却能把体积压到一半以下
+    """
+
+    device_index: int = 0
+    warmup_frames: int = 5
+    max_empty_reads: int = 10
+    max_edge: int = 1024
+    jpeg_quality: int = 85
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "CameraSettings":
+        env = os.environ if env is None else env
+        return cls(
+            device_index=_read_int(env, "AYUAN_CAMERA_DEVICE", cls.device_index),
+            max_edge=_read_int(env, "AYUAN_CAMERA_MAX_EDGE", cls.max_edge),
+            jpeg_quality=_read_int(env, "AYUAN_CAMERA_QUALITY", cls.jpeg_quality),
+        )
+
+
+# ══════════════════════════════════════════════════════════
 #  感知与交互
 # ══════════════════════════════════════════════════════════
 
@@ -205,6 +272,18 @@ class PerceptionSettings:
             stop_threshold=float(raw_stop) if _is_number(raw_stop) else None,
             idle_timeout=_read_float(env, "AYUAN_IDLE_TIMEOUT", cls.idle_timeout),
         )
+
+
+def _read_int(env: Mapping[str, str], key: str, default: int) -> int:
+    """读整数配置。非法值回落并**留痕**（与 _read_float 同一条理由）。"""
+    raw = _read_str(env, key)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("配置项 %s 的值 %r 不是合法整数，已回落到默认值 %r", key, raw, default)
+        return default
 
 
 def _is_number(raw: str) -> bool:
@@ -254,6 +333,7 @@ class Config:
     """配置总入口。"""
 
     audio: AudioSettings = field(default_factory=AudioSettings)
+    camera: CameraSettings = field(default_factory=CameraSettings)
     model: ModelSettings = field(default_factory=ModelSettings)
     perception: PerceptionSettings = field(default_factory=PerceptionSettings)
     secrets: Secrets = field(default_factory=Secrets)
@@ -271,6 +351,7 @@ class Config:
         env = os.environ if env is None else env
         return cls(
             audio=AudioSettings.from_env(env),
+            camera=CameraSettings.from_env(env),
             model=ModelSettings.from_env(env),
             perception=PerceptionSettings.from_env(env),
             secrets=Secrets.from_env(env),

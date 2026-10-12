@@ -27,6 +27,15 @@ class AudioDeviceError(AyuanError):
     """音频设备打开失败、被占用或不存在。"""
 
 
+class CameraError(AyuanError):
+    """摄像头打开失败、被占用或读到空帧。
+
+    与 AudioDeviceError 并列：两者都是「设备层的问题」，
+    但让它们分开，是为了让上层能分别给出可操作的提示
+    （麦克风被占用 vs 摄像头被占用，用户要做的事不一样）。
+    """
+
+
 class ApiError(AyuanError):
     """云端接口调用失败。
 

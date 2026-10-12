@@ -207,17 +207,33 @@ class FakeAsr:
 
 
 class FakeLlm:
+    """替身。
+
+    签名要与 ChatProvider.reply 一致（含 M5 新增的 tools / on_tool*）——
+    否则编排层一改调用方式，这里就是一个 TypeError，
+    而它会被 _run_turn 的兜底 except 吞成「未预料的异常」，
+    表现为一大片莫名其妙的测试失败（M5 实测踩过）。
+
+    同时记录**收到了什么 prompt**：M5 的视觉分支会把它换成
+    「（我刚刚看了一眼，画面里是：…）」，不记下来就没法断言。
+    """
+
     def __init__(self, sentences=None, text: str = "你好呀。") -> None:
         self.sentences = sentences if sentences is not None else ["你好呀。"]
         self.text = text
+        self.prompts: list[str] = []
+        self.tool_calls: list = []
 
-    def reply(self, user_text, memory):
+    def reply(self, user_text, memory, *, tools=None, on_tool=None, on_tool_start=None):
+        self.prompts.append(user_text)
+
         class R:
             pass
 
         result = R()
         result.text = self.text
         result.sentences = list(self.sentences)
+        result.tool_calls = list(self.tool_calls)
 
         class S:
             first_byte = 0.05
@@ -512,6 +528,183 @@ class TestOpenFailureDoesNotPoisonTheInstance:
         )
         a.stop()
         thread.join(timeout=5.0)
+
+
+# ══════════════════════════════════════════════════════
+#  M5：视觉分支与工具事件
+# ══════════════════════════════════════════════════════
+
+class FakeCamera:
+    """替身：不碰真摄像头。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.grabs = 0
+        self.closed = 0
+
+    def grab_jpeg(self) -> bytes:
+        self.grabs += 1
+        if self.fail:
+            from app.core.errors import CameraError
+
+            raise CameraError("无法打开摄像头（索引 0）", hint="摄像头可能被占用了")
+        return b"\xff\xd8\xff" + b"x" * 64
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class FakeVision:
+    def __init__(self, text: str = "一只橘猫趴在键盘上") -> None:
+        self.text = text
+        self.calls: list[bytes] = []
+
+    def describe(self, jpeg: bytes, *args, **kwargs):
+        self.calls.append(jpeg)
+
+        class R:
+            pass
+
+        result = R()
+        result.text = self.text
+        return result
+
+
+def with_vision(assistant, *, camera=None, vision=None):
+    assistant._camera = camera or FakeCamera()
+    assistant._vision = vision or FakeVision()
+    return assistant
+
+
+class TestVisionBranch:
+    """说「看看这是什么」时，编排层要先去拍一张再交给模型。"""
+
+    def test_vision_request_goes_through_the_camera(self, stop_after):
+        a, parts = make_assistant(asr=FakeAsr(text="看看这是什么"), stop=FakeStop(hits=False))
+        camera, vision = FakeCamera(), FakeVision()
+        with_vision(a, camera=camera, vision=vision)
+        events: list[str] = []
+        a.on_event = lambda e, p: events.append(e)
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: vision.calls, timeout=5.0), "应当去拍照并识别"
+        assert camera.grabs == 1
+        assert "vision_start" in events and "vision_done" in events
+
+    def test_the_scene_is_put_into_the_prompt(self, stop_after):
+        """视觉描述要拼进给 LLM 的输入 —— 否则她看了却不知道自己在看什么。"""
+        a, parts = make_assistant(asr=FakeAsr(text="看看这是什么"), stop=FakeStop(hits=False))
+        with_vision(a, vision=FakeVision("一只橘猫趴在键盘上"))
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: parts["llm"].prompts, timeout=5.0)
+        prompt = parts["llm"].prompts[0]
+        assert "一只橘猫" in prompt
+
+    def test_the_user_note_survives(self, stop_after):
+        """「看看这个零件有没有裂纹」里的问题要一并交给模型。"""
+        a, parts = make_assistant(
+            asr=FakeAsr(text="看看这个零件有没有裂纹"), stop=FakeStop(hits=False)
+        )
+        with_vision(a, vision=FakeVision("一个金属零件"))
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: parts["llm"].prompts, timeout=5.0)
+        prompt = parts["llm"].prompts[0]
+        assert "金属零件" in prompt and "裂纹" in prompt
+
+    def test_camera_is_released_after_the_shot(self, stop_after):
+        """拍完就放掉 —— 没有理由替用户一直占着摄像头。"""
+        a, parts = make_assistant(asr=FakeAsr(text="看看这是什么"), stop=FakeStop(hits=False))
+        camera = FakeCamera()
+        with_vision(a, camera=camera)
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: camera.closed > 0, timeout=5.0)
+
+    def test_ordinary_chat_never_touches_the_camera(self, stop_after):
+        a, parts = make_assistant(asr=FakeAsr(text="你好呀"), stop=FakeStop(hits=False))
+        camera = FakeCamera()
+        with_vision(a, camera=camera)
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: parts["llm"].prompts, timeout=5.0)
+        assert camera.grabs == 0, "普通聊天不该去拍照"
+
+    def test_camera_failure_does_not_break_the_turn(self, stop_after):
+        """摄像头打不开是很平常的事，它不该让整轮对话失败。"""
+        a, parts = make_assistant(asr=FakeAsr(text="看看这是什么"), stop=FakeStop(hits=False))
+        camera = FakeCamera(fail=True)
+        with_vision(a, camera=camera)
+        events: list[tuple[str, dict]] = []
+        a.on_event = lambda e, p: events.append((e, p))
+        stop_after(a)
+
+        start(a)
+        # 判据是「她说出了原因」，而不是「走完了模型」——
+        # 失败时**刻意不走模型**（见下一条测试）
+        assert wait_for(
+            lambda: any(e == "tts_done" for e, _ in events), timeout=5.0
+        ), f"拍不了照也要开口说明，实际事件：{[e for e, _ in events]}"
+
+        errors = [p for e, p in events if e == "error"]
+        assert errors, "应当发一条 error 说明为什么看不了"
+        assert "摄像头" in errors[0]["message"]
+
+    def test_camera_failure_does_not_call_the_model(self, stop_after):
+        """失败时**不走模型** —— 避免它凭空编一段「我看到了…」出来。"""
+        a, parts = make_assistant(asr=FakeAsr(text="看看这是什么"), stop=FakeStop(hits=False))
+        with_vision(a, camera=FakeCamera(fail=True))
+        stop_after(a)
+
+        start(a)
+        assert wait_for(lambda: a.speaker.play_calls > 0, timeout=5.0)
+        assert parts["llm"].prompts == [], "看不了的时候不该去问模型"
+
+
+class TestToolEvents:
+    def test_tool_events_are_forwarded(self, stop_after):
+        """L5 收到工具事件后要原样转发给界面。"""
+        from app.capabilities.llm import ToolCallRecord
+
+        a, parts = make_assistant(stop=FakeStop(hits=False))
+        events: list[tuple[str, dict]] = []
+        a.on_event = lambda e, p: events.append((e, p))
+
+        a._on_tool_start("get_weather", {"location": "北京"})
+        a._on_tool_done(
+            ToolCallRecord(
+                name="get_weather",
+                arguments={"location": "北京"},
+                ok=True,
+                result='{"city": "北京"}',
+                elapsed=0.4,
+            )
+        )
+
+        started = [p for e, p in events if e == "tool_start"]
+        done = [p for e, p in events if e == "tool_done"]
+        assert started and started[0]["name"] == "get_weather"
+        assert done and done[0]["ok"] is True
+        assert "北京" in done[0]["result"]
+
+    def test_long_tool_results_are_truncated(self):
+        """工具结果可能是整段 JSON，事件日志不必背下全文。"""
+        from app.capabilities.llm import ToolCallRecord
+
+        a, _ = make_assistant()
+        events: list[dict] = []
+        a.on_event = lambda e, p: events.append(p) if e == "tool_done" else None
+
+        a._on_tool_done(
+            ToolCallRecord(name="t", arguments={}, ok=True, result="x" * 5000, elapsed=0.1)
+        )
+        assert len(events[0]["result"]) <= 300
 
 
 class TestThresholdParameter:

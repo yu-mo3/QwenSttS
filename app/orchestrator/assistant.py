@@ -46,6 +46,7 @@ from app.capabilities.tts import SpeechSynthesizer
 from app.config import Config
 from app.core.errors import ApiError, AyuanError
 from app.core.logger import get_logger
+from app.agent import ToolRegistry, build_registry
 from app.orchestrator.events import (
     ALL_COMMANDS,
     CMD_LISTEN,
@@ -65,12 +66,21 @@ from app.orchestrator.events import (
     EVT_SPEECH_END,
     EVT_SPEECH_START,
     EVT_STATE,
+    EVT_TOOL_DONE,
+    EVT_TOOL_START,
     EVT_TTS_DONE,
+    EVT_VISION_DONE,
+    EVT_VISION_START,
     EVT_WAKE,
     EventCallback,
     TurnResult,
 )
 from app.orchestrator.states import AssistantState, InvalidTransition, can_transition
+from app.orchestrator.vision_intent import (
+    is_vision_request,
+    strip_trigger,
+    with_vision_context,
+)
 
 log = get_logger(__name__)
 
@@ -272,6 +282,17 @@ class VoiceAssistant:
         self.tts = SpeechSynthesizer(config, on_retry=self._on_retry)
         self.memory = ConversationMemory()
 
+        # ---- 工具池（M5）----
+        # 现在就建：它只是一组对象，不碰网络也不碰硬件；
+        # 真正花钱的是模型决定调它的那一刻。
+        self.tools: ToolRegistry = build_registry(config)
+
+        # ---- 视觉（M5，延迟构造）----
+        # 摄像头只在真的要拍照时才打开 —— 常驻助手不该一启动就占着它，
+        # 那会让用户开视频会议时发现「摄像头被占用」。
+        self._camera = None
+        self._vision = None
+
         # ---- 感知层（三个独立实例，绝不共用）----
         self._wake = None
         self._stop = None
@@ -338,6 +359,22 @@ class VoiceAssistant:
                 )
             )
         return self._stop
+
+    @property
+    def camera(self):
+        if self._camera is None:
+            from app.camera import Camera
+
+            self._camera = Camera(self.config.camera)
+        return self._camera
+
+    @property
+    def vision(self):
+        if self._vision is None:
+            from app.capabilities.vlm import VisionProvider
+
+            self._vision = VisionProvider(self.config)
+        return self._vision
 
     @property
     def vad(self):
@@ -818,11 +855,30 @@ class VoiceAssistant:
                 self._running = False
                 return result
 
+            # ---- 视觉：这一轮是不是在要求「看一眼」----
+            # 用 result.user_text（而不是 transcript.text）：打字输入没有 transcript，
+            # 而两条入口之后的所有逻辑都必须共用同一份「用户说了什么」
+            prompt_text = result.user_text
+            if is_vision_request(prompt_text):
+                looked, payload = self._look_around()
+                if not looked:
+                    # 拍不了照就**直接把原因说出来**，不走模型 ——
+                    # 省一次往返，更重要的是避免模型自由发挥、
+                    # 凭空编一段「我看到了……」出来。
+                    result.reply_text = f"我这会儿看不了：{payload}"
+                    self._start_speaking([result.reply_text], result)
+                    return result
+                prompt_text = with_vision_context(payload, strip_trigger(prompt_text))
+
             # ---- 生成 ----
             t0 = time.monotonic()
-            # 用 result.user_text 而不是 transcript.text：打字输入没有 transcript，
-            # 而两条入口之后的所有逻辑都必须共用同一份「用户说了什么」
-            reply = self.llm.reply(result.user_text, self.memory)
+            reply = self.llm.reply(
+                prompt_text,
+                self.memory,
+                tools=self.tools,
+                on_tool_start=self._on_tool_start,
+                on_tool=self._on_tool_done,
+            )
             result.timings["对话"] = time.monotonic() - t0
             result.reply_text = reply.text
             self._emit(
@@ -876,6 +932,48 @@ class VoiceAssistant:
         # 存下来的合计既漏掉播报，又会在 timing_summary() 求和时被再加一遍
         # —— 与 M2 审查 B2 是同一类矛盾。合计一律由 timing_summary() 现算。
         return result
+
+    # ══════════════════════════════════════════════════════
+    #  视觉与工具（M5）
+    # ══════════════════════════════════════════════════════
+
+    def _look_around(self) -> tuple[bool, str]:
+        """拍一张交给视觉模型。返回 (是否成功, 描述或失败原因)。
+
+        **失败不抛异常**：摄像头打不开是很平常的事（被占用、被禁用、
+        笔记本的物理遮挡没推开），它不该让整轮对话失败。
+        失败时把原因当作文案交回去，让用户听到一句人话。
+        """
+        self._emit(EVT_VISION_START)
+        started = time.monotonic()
+        try:
+            jpeg = self.camera.grab_jpeg()
+            description = self.vision.describe(jpeg).text
+        except AyuanError as exc:
+            log.warning("视觉理解失败：%s", exc)
+            self._emit(EVT_ERROR, message=exc.message, hint=exc.hint)
+            return False, exc.hint or exc.message
+        finally:
+            # 拍完就放掉摄像头 —— 没有理由替用户一直占着它
+            self.camera.close()
+
+        elapsed = time.monotonic() - started
+        log.info("视觉理解完成：%.2fs · %d 字", elapsed, len(description))
+        self._emit(EVT_VISION_DONE, text=description, elapsed=elapsed)
+        return True, description
+
+    def _on_tool_start(self, name: str, arguments: dict) -> None:
+        self._emit(EVT_TOOL_START, name=name, arguments=arguments)
+
+    def _on_tool_done(self, record) -> None:
+        self._emit(
+            EVT_TOOL_DONE,
+            name=record.name,
+            ok=record.ok,
+            elapsed=record.elapsed,
+            # 截断：工具结果可能是整段 JSON，事件日志不必背下全文
+            result=record.result[:300],
+        )
 
     def _start_speaking(self, sentences: list[str], result: TurnResult) -> None:
         """启动播报线程并**立即返回**。
@@ -1006,3 +1104,5 @@ class VoiceAssistant:
         self._running = False
         self.speaker.stop()
         self.microphone.close()
+        if self._camera is not None:
+            self._camera.close()

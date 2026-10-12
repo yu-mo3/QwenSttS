@@ -37,8 +37,9 @@
 | 🛑 **随时打断** | 播报过程中喊「停」立刻停下 | ✅ M3 |
 | ⚡ **边说边播** | 播放第 i 句时第 i+1 句已在合成，总时长显著缩短 | ✅ M3 |
 | 🖥️ **图形界面** | 脸谱式光球随状态变化，右侧对话历史，可展开技术面板 | ✅ M4 |
-| 👁️ **视觉理解** | 说「看看这是什么」，摄像头拍一张交给视觉大模型描述 | ⏳ M5 |
-| 🌤️ **工具调用** | 问天气会真的去查天气，而不是编一个 | ⏳ M5 |
+| 👁️ **视觉理解** | 说「看看这是什么」，摄像头拍一张交给视觉大模型描述 | ✅ M5 |
+| 🌤️ **工具调用** | 问天气会真的去查天气，而不是编一个 | ✅ M5 |
+| 📦 **免安装分发** | 一个文件夹，解压双击就能跑；唤醒模型已打包在内 | ✅ M5 |
 
 ## 🚀 快速开始
 
@@ -97,7 +98,7 @@ DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxx
 
 ### 在 VSCode 中启动（推荐）
 
-用 VSCode 打开项目文件夹，按 **F5** 就能跑。项目已内置 4 个调试配置（`.vscode/launch.json`）：
+用 VSCode 打开项目文件夹，按 **F5** 就能跑。项目已内置 11 个调试配置（`.vscode/launch.json`），下面是最常用的几个：
 
 | 调试配置 | 作用 |
 |---|---|
@@ -124,6 +125,13 @@ VSCode 首次打开会提示安装推荐扩展（Python / Pylance / debugpy）�
 python tools/m2_chat.py         # 对着麦克风说话，她会用语音回你
 python tools/m2_chat.py --text  # 纯文字模式（不录音，打字测试）
 python tools/m2_chat.py --say "你好"   # 只跑一轮，用于自动化验证
+
+# M5：视觉与工具
+python tools/m5_vision.py                    # 拍照并描述
+python tools/m5_vision.py --image 图片.jpg   # 用现成的图（摄像头坏了也能验证）
+python tools/m5_weather.py                   # 问她天气，看她会不会真的去查
+python tools/m5_weather.py --tool-only       # 只测工具，不走模型
+python tools/check_camera.py                 # 摄像头打不开时先跑这个
 ```
 
 ### 三种入口的分工
@@ -132,10 +140,42 @@ python tools/m2_chat.py --say "你好"   # 只跑一轮，用于自动化验证
 |---|---|
 | `app/ui/app.py` | **日常使用**：图形界面（VSCode F5 / `python -m app.ui`） |
 | `tools/m3_assistant.py` | 免按钮语音对话的**命令行**入口，没有界面时排障最快 |
+| `tools/m5_*.py` | M5 的视觉与工具验收，都能绕开各自的外部依赖单独跑 |
 | `app/main.py` | 项目体检面板：配置摘要 / 里程碑进度 / 音频设备 |
 | `run.bat` | 不想开 IDE，双击即用；将来打包给别人也是它 |
 | `tools/check_env.py` | 独立的诊断工具，专门排查环境问题 |
 
+## 📦 打包分发（M5）
+
+双击 **`build.bat`**，产物在 `dist/Ayuan/`：**一个文件夹，解压双击就能跑**，
+不需要装 Python。唤醒模型已经打包在内，**首次运行不依赖网络**。
+
+| | |
+|---|---|
+| 体积 | 约 250MB（压缩后更小） |
+| 形态 | onedir —— 启动快、出问题能直接翻目录排查 |
+| 用户要做的 | 把 `_internal/.env.example` 复制成 `.env`（**放在 exe 旁边**）并填密钥 |
+| 出问题看哪 | exe 旁边的 `data/ayuan.log` 与 `data/crash.log` |
+
+> 🔐 **`.env` 不会被打进包里** —— 那里面是密钥。分发的是模板。
+
+打包排障时用调试版（带控制台，正式包什么都不显示）：
+
+```bat
+set AYUAN_BUILD_CONSOLE=1
+build.bat
+```
+
+### 打包踩过的坑
+
+**Qt 平台插件会静默丢失。** PyInstaller 靠 `import PySide6.QtCore` 去问
+Qt「插件在哪」，而这个 conda 环境里那个 import 本来就失败（见上面的 ICU 问题）。
+失败时它**不报错**，只是安静地少收一批文件 —— 构建日志全绿、产物也生成了，
+但 exe 一启动就死在 `Could not find the Qt platform plugin`。
+
+所以 `ayuan.spec` 里做了两件事：分析前预加载系统 ICU、**显式收集** Qt 插件；
+并且加了一条构建期自检 —— 一个平台插件都没收到就直接让构建失败，
+而不是发一个跑不起来的包出去。
 ## 🏗️ 架构
 
 分层设计，每一层只依赖它下面的一层。业务代码不直接碰硬件，也不直接碰云服务。
@@ -147,11 +187,11 @@ python tools/m2_chat.py --say "你好"   # 只跑一轮，用于自动化验证
 │ L5 编排层    状态机：待机→唤醒→聆听→思考→说话→被打断      │
 ├──────────────────────────────────────────────────────────┤
 │ L4 能力层    ASR │ LLM │ TTS │ VLM  （统一 Provider 接口） │
-│              └── Agent 工具池（天气 / 时间 / …）           │
+│              └── Agent 工具池（注册表 / schema / 分发）     │
 ├──────────────────────────────────────────────────────────┤
 │ L3 感知前端  VAD 断句 │ 关键词唤醒 │ 打断检测             │
 ├──────────────────────────────────────────────────────────┤
-│ L2 设备层    麦克风采集（16kHz PCM）│ 扬声器播放（可打断）  │
+│ L2 设备层    麦克风 │ 扬声器 │ 摄像头                      │
 ├──────────────────────────────────────────────────────────┤
 │ L1 基础层    配置 / 日志 / 异常                            │
 ├──────────────────────────────────────────────────────────┤
@@ -185,7 +225,7 @@ python tools/m2_chat.py --say "你好"   # 只跑一轮，用于自动化验证
 ```
 QwenSttS/
 ├─ app/
-│  ├─ main.py              # 应用主入口（VSCode F5 就跑它）
+│  ├─ main.py              # 项目体检面板（配置 / 里程碑 / 音频设备）
 │  ├─ config.py            # 全局配置（.env + 默认值）
 │  ├─ core/                # L1 基础层
 │  │  ├─ errors.py         #   统一异常类型
@@ -209,6 +249,12 @@ QwenSttS/
 │  │  ├─ vad.py            #   人声判定（WebRTC VAD + 能量双条件）
 │  │  ├─ segmenter.py      #   语音段切分（起止判定 + 前后缓冲）
 │  │  └─ wakeword.py       #   关键词唤醒（sherpa-onnx KWS）
+│  ├─ camera/              # L2 设备层 · 摄像头（M5）
+│  │  └─ capture.py        #   抓一帧 -> JPEG 字节，不落盘
+│  ├─ agent/               # L4 工具池（M5）
+│  │  ├─ base.py           #   Tool 抽象：名字 / 描述 / 参数 schema
+│  │  ├─ registry.py       #   注册表、参数校验、超时、**失败不抛穿**
+│  │  └─ weather.py        #   天气工具（心知天气）
 │  ├─ ui/                  # L6 表现层（M4）
 │  │  ├─ app.py            #   入口：python -m app.ui
 │  │  ├─ main_window.py    #   主窗口装配
@@ -221,7 +267,6 @@ QwenSttS/
 │  │  ├─ bridge.py         #   事件 -> Qt 信号，跨线程安全投递
 │  │  ├─ theme.py          #   配色 / 尺寸 / QSS（不 import Qt，可单测）
 │  │  └─ qt_runtime.py     #   conda 环境下的 ICU 加载修补
-│  └─ agent/               # L4 工具池      （M5）
 ├─ .vscode/                # 调试配置（团队共享，已入库）
 ├─ tools/
 │  ├─ check_env.py         # M1 环境自检脚本
@@ -229,13 +274,19 @@ QwenSttS/
 │  ├─ m3_assistant.py      # M3 免按钮对话验收脚本
 │  ├─ record_sample.py     # 录音采样（唤醒词验证用）
 │  ├─ wake_test.py         # 唤醒词真人验证 + 阈值扫描
+│  ├─ check_camera.py      # 摄像头自检（打不开时给五步排查清单）
+│  ├─ m5_vision.py         # M5 视觉验收（--image 可绕过摄像头）
+│  ├─ m5_weather.py        # M5 工具池验收（--tool-only 只测工具）
+│  ├─ pyinstaller_hooks/   # 打包用的 hook 覆盖
 │  └─ download_models.py   # 下载唤醒模型（约 31MB，不入库）
 ├─ models/                 # 离线模型（不入库，运行时下载）
 ├─ data/                   # 运行产物（不入库）
-├─ .env.example            # 密钥模板
 ├─ requirements.txt
+├─ .env.example            # 密钥模板
 ├─ setup.bat               # 一键初始化
-└─ run.bat                 # 一键自检
+├─ run.bat                 # 一键自检
+├─ build.bat               # 一键打包（M5，产物在 dist/Ayuan/）
+└─ ayuan.spec              # 打包定义（入库、可复现）
 ```
 
 ## 🗺️ 路线图
@@ -246,7 +297,7 @@ QwenSttS/
 | **M2** | L4 能力层：语音识别 → 对话 → 语音合成，命令行闭环 | ✅ 已完成 |
 | **M3** | L3 感知层 + L5 编排层：离线唤醒、VAD 断句、连续对话、打断 | ✅ 已完成 |
 | **M4** | L6 表现层：PySide6 桌面界面 | ✅ 已完成 |
-| **M5** | 视觉理解 + Agent 工具池 + 打包分发 | ⏳ 计划中 |
+| **M5** | 视觉理解 + Agent 工具池 + 打包分发 | ✅ 已完成 |
 
 ## ❓ 常见问题
 
@@ -322,7 +373,7 @@ Windows 有 MME / DirectSound / WASAPI / WDM-KS 四套音频接口，同一硬�
 | 组织方式 | 9 章 9 个独立脚本 | 7 层架构，能力按层归位 |
 | 数据传递 | 固定路径磁盘文件 | 内存字节流 |
 | 密钥 | 硬编码在源码里 | `.env` + `.gitignore` |
-| 线程模型 | 主线程阻塞（UI 会卡死） | asyncio 独立线程 + Qt 信号槽 |
+| 线程模型 | 主线程阻塞（UI 会卡死） | 独立线程跑会话 + Qt 信号槽回 GUI 线程 |
 | 对话记忆 | 无 | 会话级上下文 |
 | 打断 | 无 | 支持 |
 </details>
