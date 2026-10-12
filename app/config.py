@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,10 +26,40 @@ from app.core.logger import get_logger
 
 log = get_logger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _is_frozen() -> bool:
+    """是不是打包成了 exe（PyInstaller 会设 sys.frozen）。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _user_root() -> Path:
+    """**用户自己的东西**放哪：.env、data/。
+
+    打包之后 `__file__` 指向的是包内部的 `_internal` 目录 ——
+    让用户把 .env 放进那里等于让他去拆包。所以冻结时改用
+    **可执行文件所在目录**：.env 就放在 exe 旁边，打开文件夹就能看见。
+    """
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _resource_root() -> Path:
+    """**随包分发的资源**放哪：models/。
+
+    这一份跟 .env 不同 —— 它是打包时就塞进去的，解包后住在
+    PyInstaller 的临时目录（`sys._MEIPASS`）里，用户不该也不需要去动它。
+    """
+    if _is_frozen():
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent.parent
+
+
+#: 用户目录（.env、data/）。保持旧名字不变 —— tools/ 与测试都在用。
+PROJECT_ROOT = _user_root()
 ENV_FILE = PROJECT_ROOT / ".env"
 DATA_DIR = PROJECT_ROOT / "data"
-MODELS_DIR = PROJECT_ROOT / "models"
+#: 模型目录来自**资源**根，不是用户根
+MODELS_DIR = _resource_root() / "models"
 
 # .env 不存在时静默跳过——跑自检脚本不该因为还没配密钥就崩溃
 load_dotenv(ENV_FILE)

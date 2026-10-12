@@ -25,6 +25,8 @@ __pycache__/
 .eggs/
 build/
 dist/
+# 调试版构建（带控制台，用 AYUAN_BUILD_CONSOLE=1 打出来的）
+dist-debug/
 .venv/
 venv/
 env/

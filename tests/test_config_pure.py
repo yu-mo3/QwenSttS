@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import config as config_module
 from app.config import AudioSettings, Config, ModelSettings, Secrets, mask_secret
 
 
@@ -99,3 +100,55 @@ class TestConfigLoad:
         config = Config.load({})
         assert not config.secrets.has_dashscope
         assert config.log_level == "INFO"
+
+
+# ══════════════════════════════════════════════════════
+#  打包后的路径（M5-5）
+# ══════════════════════════════════════════════════════
+
+class TestFrozenPaths:
+    """打包成 exe 之后，`__file__` 指向包内部的 _internal 目录。
+
+    让用户把 .env 放进那里等于让他去拆包。所以冻结时**用户根**改用
+    可执行文件所在目录，而**资源根**（随包分发的模型）仍在 _MEIPASS。
+    两个根分开，是 M5-5 打包时发现必须做的事。
+    """
+
+    def test_dev_mode_uses_one_root(self) -> None:
+        assert config_module._user_root() == config_module._resource_root()
+        assert config_module._resource_root() == config_module.PROJECT_ROOT
+
+    def test_not_frozen_by_default(self) -> None:
+        assert config_module._is_frozen() is False
+
+    def test_frozen_splits_the_two_roots(self, monkeypatch, tmp_path) -> None:
+        exe = tmp_path / "Ayuan"
+        internal = tmp_path / "_internal"
+        exe.mkdir()
+        internal.mkdir()
+        monkeypatch.setattr(config_module.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(config_module.sys, "executable", str(exe / "Ayuan.exe"))
+        monkeypatch.setattr(config_module.sys, "_MEIPASS", str(internal), raising=False)
+
+        assert config_module._is_frozen() is True
+        assert config_module._user_root() == exe, ".env 要放在 exe 旁边，用户才找得到"
+        assert config_module._resource_root() == internal, "模型是随包分发的资源"
+
+    def test_frozen_without_meipass_falls_back_to_the_exe_dir(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """_MEIPASS 不在时也不能崩 —— 退回 exe 目录总比抛异常好。"""
+        monkeypatch.setattr(config_module.sys, "frozen", True, raising=False)
+        monkeypatch.setattr(config_module.sys, "executable", str(tmp_path / "Ayuan.exe"))
+        monkeypatch.delattr(config_module.sys, "_MEIPASS", raising=False)
+
+        assert config_module._resource_root() == tmp_path
+        assert config_module._user_root() == tmp_path
+
+    def test_models_dir_comes_from_the_resource_root(self) -> None:
+        assert config_module.MODELS_DIR.name == "models"
+        assert config_module.MODELS_DIR.parent == config_module._resource_root()
+
+    def test_env_file_comes_from_the_user_root(self) -> None:
+        assert config_module.ENV_FILE.name == ".env"
+        assert config_module.ENV_FILE.parent == config_module._user_root()

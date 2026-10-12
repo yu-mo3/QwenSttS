@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 # 允许两种启动方式：python -m app.ui / python app/ui/app.py
@@ -79,8 +80,15 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     config = Config.load()
-    setup_logging("DEBUG" if args.verbose else config.log_level)
     config.ensure_dirs()
+
+    # 打包成 exe 之后没有控制台 —— 出错时用户手上什么都没有，
+    # 而「双击没反应」是最难远程排查的一类问题。
+    # 所以冻结时额外写一份日志文件，就放在 exe 旁边，用户找得到。
+    log_file = config.data_dir / "ayuan.log" if getattr(sys, "frozen", False) else None
+    setup_logging("DEBUG" if args.verbose else config.log_level, log_file=log_file)
+    if log_file is not None:
+        log.info("日志同时写入：%s", log_file)
 
     # 只把程序名交给 Qt：其余参数是给我们自己的，
     # 交给 Qt 解析会被它当成未知选项直接退出进程
@@ -143,5 +151,35 @@ def main(argv: list[str] | None = None) -> int:
     return app.exec()
 
 
+def _log_crash() -> None:
+    """把未预料的启动异常写到文件。
+
+    **打包后没有控制台** —— 这是用户唯一能拿到的线索，也是远程排障时
+    我们唯一能看的东西。PyInstaller 的 windowed 模式虽然会弹一个错误框，
+    但那个框关掉就什么都没了，而且它显示的东西用户往往看不懂、也复制不出来。
+
+    落盘目标是**用户目录**（exe 旁边），不是包内部的 _internal ——
+    用户得能打开这个文件。
+    """
+    import traceback
+
+    try:
+        config = Config.load()
+        target = config.data_dir / "crash.log"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            handle.write(traceback.format_exc())
+        print(f"启动失败，详情已写入 {target}", file=sys.stderr or sys.stdout)
+    except Exception:  # noqa: BLE001 — 连崩溃日志都写不了就只能放弃了
+        pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        _log_crash()
+        raise
