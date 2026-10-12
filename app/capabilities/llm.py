@@ -22,11 +22,13 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from app.agent.registry import MAX_TOOL_CALLS_PER_TURN
 from app.capabilities.base import CallStats
 from app.config import Config
 from app.core.errors import ApiError
@@ -41,6 +43,11 @@ log = get_logger(__name__)
 # 单次请求携带的历史字符上限。人设要求「不超过三句话」，正常回复 30~60 字，
 # 4000 字足够放下十几轮；一旦某轮异常冗长，会自动从最旧的轮开始丢弃。
 DEFAULT_CHAR_BUDGET = 4000
+
+#: 一次回复里最多跑几轮「模型要工具 -> 执行 -> 再生成」。
+#: 一轮足够覆盖绝大多数场景（查天气 -> 组织回答）；给到 2 是留一次纠错机会
+#: （模型第一次把城市名填错了，看到错误结果后能再试一次）。
+MAX_TOOL_ROUNDS = 2
 
 SYSTEM_PROMPT = """你叫阿源，是一位聪明、亲切的智能语音助手。
 
@@ -209,8 +216,83 @@ def clean_for_speech(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════
+#  工具调用（纯函数，可单测）
+# ══════════════════════════════════════════════════════════
+
+def _assistant_tool_message(content: str, calls: list[dict[str, str]]) -> dict[str, Any]:
+    """把「模型要求调这些工具」拼成一条 assistant 消息。
+
+    形状必须严格按协议：content 在只有工具调用时给 None（给空字符串
+    有些实现会当成「说了一句空话」而拒绝），tool_calls 里每项带
+    id / type / function{name, arguments}。
+    """
+    return {
+        "role": "assistant",
+        "content": content or None,
+        "tool_calls": [
+            {
+                "id": call.get("id") or f"call_{index}",
+                "type": "function",
+                "function": {
+                    "name": call.get("name") or "",
+                    "arguments": call.get("arguments") or "{}",
+                },
+            }
+            for index, call in enumerate(calls)
+        ],
+    }
+
+
+def _safe_arguments(raw: str) -> dict[str, Any]:
+    """把模型给的参数字符串解析成字典，**只用于展示**。
+
+    解析不了就原样留着 —— 注册表那边会把「参数不是合法 JSON」变成一条
+    工具结果回给模型，而这里只需要让技术面板能看清它到底发了什么。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"_原始": text[:200]}
+    return parsed if isinstance(parsed, dict) else {"_原始": text[:200]}
+
+
+def _run_tool(tools, call: dict[str, str]) -> ToolCallRecord:
+    """执行一次工具调用。**本身不抛异常** —— 注册表已经保证了这一点。"""
+    name = call.get("name") or ""
+    raw = call.get("arguments") or ""
+    started = time.monotonic()
+    result = tools.execute(name, raw)
+    return ToolCallRecord(
+        name=name,
+        arguments=_safe_arguments(raw),
+        ok=result.ok,
+        result=result.content,
+        elapsed=time.monotonic() - started,
+    )
+
+
+# ══════════════════════════════════════════════════════════
 #  Provider
 # ══════════════════════════════════════════════════════════
+
+@dataclass
+class ToolCallRecord:
+    """一次工具调用的留痕，供界面展示与排障。"""
+
+    name: str
+    arguments: dict[str, Any]
+    ok: bool
+    result: str
+    elapsed: float = 0.0
+
+    def summary(self) -> str:
+        args = "、".join(f"{k}={v}" for k, v in self.arguments.items())
+        head = f"{self.name}({args})" if args else self.name
+        return f"{head} {'✓' if self.ok else '✗'} {self.elapsed:.2f}s"
+
 
 @dataclass
 class ChatReply:
@@ -220,6 +302,8 @@ class ChatReply:
     sentences: list[str] = field(default_factory=list)
     stats: CallStats | None = None
     memory_turns: int = 0
+    #: 这一轮里执行过的工具。空列表 = 普通对话，没有调任何工具。
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
 
 
 class ChatProvider:
@@ -248,21 +332,43 @@ class ChatProvider:
         return self._client
 
     def stream(self, messages: list[dict[str, str]]) -> Iterator[str]:
-        """流式产出模型回复的文本片段。"""
+        """流式产出模型回复的文本片段（不带工具）。"""
+        yield from self._stream_turn(messages, tools=None, sink={})
+
+    def _stream_turn(self, messages: list, *, tools, sink: dict) -> Iterator[str]:
+        """跑一轮请求。
+
+        文本片段**边收边 yield**；工具调用是**碎片**，累积到轮末塞进 sink。
+
+        为什么用 sink 而不是把两者都 yield：文本是「流」，工具调用是
+        「累积到最后才完整的整体」—— 混在同一个 yield 里，调用方每一段
+        都要判断「这是文本还是工具」。分开之后，循环读起来就是
+        「边收边切句，收完再看有没有工具要调」。
+
+        工具调用的碎片形态（OpenAI 流式协议）：每个 delta 里带
+        `tool_calls[i].function.arguments` 的一小段字符串，要按 index 拼起来。
+        名字和 id 通常只在第一片里出现，所以后到的空值不能覆盖已有的值。
+        """
+        request: dict[str, Any] = {
+            "model": self.config.model.llm,
+            "messages": messages,
+            "stream": True,
+            # enable_thinking 是百炼的扩展参数，必须走 extra_body
+            "extra_body": {"enable_thinking": self.config.model.enable_thinking},
+        }
+        if tools is not None and len(tools):
+            request["tools"] = tools.schemas()
+            request["tool_choice"] = "auto"
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model.llm,
-                messages=messages,
-                stream=True,
-                # enable_thinking 是百炼的扩展参数，必须走 extra_body
-                extra_body={"enable_thinking": self.config.model.enable_thinking},
-            )
+            response = self.client.chat.completions.create(**request)
         except Exception as exc:
             raise ApiError(
                 "发起对话请求失败",
                 hint=f"{exc}。请检查模型名 {self.config.model.llm} 是否正确、额度是否充足。",
             ) from exc
 
+        fragments: dict[int, dict[str, str]] = {}
         try:
             for chunk in response:
                 choices = getattr(chunk, "choices", None)
@@ -271,16 +377,46 @@ class ChatProvider:
                 delta = getattr(choices[0], "delta", None)
                 if delta is None:
                     continue
+
+                for call in getattr(delta, "tool_calls", None) or []:
+                    index = getattr(call, "index", 0)
+                    index = 0 if index is None else int(index)
+                    slot = fragments.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if getattr(call, "id", None):
+                        slot["id"] = str(call.id)
+                    function = getattr(call, "function", None)
+                    if function is not None:
+                        if getattr(function, "name", None):
+                            slot["name"] = str(function.name)
+                        piece = getattr(function, "arguments", None)
+                        if piece:
+                            slot["arguments"] += str(piece)
+
                 piece = getattr(delta, "content", None)
                 if piece:
                     yield piece
         except Exception as exc:
             raise ApiError("接收对话回复中断", hint=str(exc)) from exc
 
-    def reply(self, user_text: str, memory: ConversationMemory) -> ChatReply:
-        """完整的一轮对话：发送 → 流式接收 → 分句。
+        sink["calls"] = [fragments[i] for i in sorted(fragments)]
 
-        返回整段文本与切好的句子列表。
+    def reply(
+        self,
+        user_text: str,
+        memory: ConversationMemory,
+        *,
+        tools=None,
+        on_tool=None,
+    ) -> ChatReply:
+        """完整的一轮对话：发送 -> 流式接收 -> （必要时调工具）-> 分句。
+
+        Args:
+            tools: ToolRegistry 或 None。**None 时行为与 M2 完全一致** ——
+                不带 tools 参数、不做额外请求、首字延迟一点不变。
+            on_tool: 每次工具执行完的回调，参数是 ToolCallRecord。
+                界面用它显示「正在查天气…」，而不是让她沉默三秒。
         """
         if not user_text.strip():
             raise ApiError("对话内容为空", hint="没有识别到有效的用户输入")
@@ -292,30 +428,84 @@ class ChatProvider:
         buffer = ""
         sentences: list[str] = []
         collected: list[str] = []
+        records: list[ToolCallRecord] = []
+        executed = 0
 
-        for piece in self.stream(messages):
-            if first_token is None:
-                first_token = time.monotonic() - started
-            collected.append(piece)
-            buffer += piece
+        # 第 0 轮是正常生成；之后的每一轮都是「工具结果已回填，再生成一次」。
+        for round_index in range(MAX_TOOL_ROUNDS + 1):
+            sink: dict = {}
+            round_pieces: list[str] = []
 
-            sentence, buffer = split_sentence(buffer)
-            while sentence:
-                cleaned = clean_for_speech(sentence)
-                if cleaned:
-                    sentences.append(cleaned)
+            for piece in self._stream_turn(messages, tools=tools, sink=sink):
+                if first_token is None:
+                    first_token = time.monotonic() - started
+                round_pieces.append(piece)
+                collected.append(piece)
+                buffer += piece
+
                 sentence, buffer = split_sentence(buffer)
+                while sentence:
+                    cleaned = clean_for_speech(sentence)
+                    if cleaned:
+                        sentences.append(cleaned)
+                    sentence, buffer = split_sentence(buffer)
+
+            calls = sink.get("calls") or []
+            if not calls:
+                break
+
+            if tools is None or not len(tools):
+                # 没给工具却收到 tool_calls —— 协议上不该发生，
+                # 但静默丢掉比报错更糟：至少留一条日志能查到
+                log.warning("模型要求调用工具，但这一轮没有提供工具池，忽略")
+                break
+
+            if round_index >= MAX_TOOL_ROUNDS or executed >= MAX_TOOL_CALLS_PER_TURN:
+                # 到达上限就**停止调工具、把已有的话说出去**，
+                # 而不是无限循环。宁可答案不完整，也不能转不出来。
+                log.warning(
+                    "工具调用已达上限（%d 轮 / %d 次），改为直接作答",
+                    MAX_TOOL_ROUNDS,
+                    MAX_TOOL_CALLS_PER_TURN,
+                )
+                break
+
+            messages.append(_assistant_tool_message("".join(round_pieces), calls))
+
+            for call in calls:
+                if executed >= MAX_TOOL_CALLS_PER_TURN:
+                    log.warning("本轮工具调用次数已达上限 %d，剩下的跳过", MAX_TOOL_CALLS_PER_TURN)
+                    break
+                executed += 1
+                record = _run_tool(tools, call)
+                records.append(record)
+                log.info("工具 %s", record.summary())
+                if on_tool is not None:
+                    try:
+                        on_tool(record)
+                    except Exception as exc:  # noqa: BLE001 — 订阅方出错不拖垮对话
+                        log.warning("工具回调抛错：%s", exc)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or f"call_{executed}",
+                        "content": record.result,
+                    }
+                )
 
         tail = clean_for_speech(buffer)
         if tail:
             sentences.append(tail)
 
         full_text = clean_for_speech("".join(collected))
+        extra: dict[str, Any] = {"模型": self.config.model.llm, "句数": len(sentences)}
+        if records:
+            extra["工具"] = "、".join(r.name for r in records)
         stats = CallStats(
             name="LLM",
             elapsed=time.monotonic() - started,
             first_byte=first_token,
-            extra={"模型": self.config.model.llm, "句数": len(sentences)},
+            extra=extra,
         )
 
         if full_text:
@@ -327,4 +517,5 @@ class ChatProvider:
             sentences=sentences,
             stats=stats,
             memory_turns=memory.turn_count,
+            tool_calls=records,
         )
